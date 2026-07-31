@@ -1,90 +1,106 @@
 /**
- * db.ts — SQLite via better-sqlite3, WAL mode (§5).
+ * db.ts — Postgres via `pg` (§5).
+ *
+ * App Platform containers have no persistent disk, so the store is a managed
+ * database rather than a local SQLite file. Everything below is async as a
+ * consequence; the schema and the guarantees are otherwise unchanged.
  *
  * Two invariants the schema enforces rather than trusts:
  *   • `assessment` is append-only. There is no update path in this module.
  *   • VIN is the dedup key for relistings. One `vehicle` row per VIN; a
  *     returning lot appends an assessment rather than duplicating inventory.
  */
-import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { DB_PATH } from './config.js';
+import { Pool, type PoolClient } from 'pg';
+import { DATABASE_URL, DB_SSL } from './config.js';
 
-export type DB = Database.Database;
+let pool: Pool | null = null;
 
-let handle: DB | null = null;
-
-export function db(): DB {
-  if (handle) return handle;
-  mkdirSync(dirname(DB_PATH), { recursive: true });
-  const d = new Database(DB_PATH);
-  d.pragma('journal_mode = WAL');
-  d.pragma('foreign_keys = ON');
-  d.pragma('busy_timeout = 5000');
-  migrate(d);
-  handle = d;
-  return d;
+export function db(): Pool {
+  if (pool) return pool;
+  if (!DATABASE_URL) {
+    throw new Error('DATABASE_URL is not set — the app cannot reach its database.');
+  }
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    // Managed Postgres presents a CA the container does not carry. The
+    // connection is still TLS; only the chain check is relaxed.
+    ssl: DB_SSL ? { rejectUnauthorized: false } : undefined,
+    max: 4,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 15_000,
+  });
+  return pool;
 }
 
-function migrate(d: DB): void {
-  d.exec(`
+export async function closeDb(): Promise<void> {
+  await pool?.end();
+  pool = null;
+}
+
+const q = async <T = unknown>(text: string, values: readonly unknown[] = []): Promise<T[]> =>
+  (await db().query(text, values as unknown[])).rows as T[];
+
+export const nowIso = (): string => new Date().toISOString();
+export const today = (): string => new Date().toISOString().slice(0, 10);
+
+// ── schema ─────────────────────────────────────────────────────────────────
+
+export async function migrate(): Promise<void> {
+  await q(`
     CREATE TABLE IF NOT EXISTS vehicle (
       id                TEXT PRIMARY KEY,
       vin               TEXT,
-      lot_no            INTEGER,
+      lot_no            BIGINT,
       url               TEXT NOT NULL,
       make              TEXT,
       model             TEXT,
       model_key         TEXT,
       year              INTEGER,
       description       TEXT,
-      starting_bid      INTEGER,
-      clean_title       INTEGER,          -- 1 | 0 | NULL (absent ⇒ unverified)
+      starting_bid      BIGINT,
+      clean_title       BOOLEAN,           -- NULL ⇒ absent ⇒ unverified
       primary_damage    TEXT,
-      secondary_damage  TEXT,             -- NULL when payload said "-"
+      secondary_damage  TEXT,              -- NULL when payload said "-"
       start_code        TEXT,
-      mileage_km        INTEGER,
+      mileage_km        BIGINT,
       auction_id        TEXT,
       lane              TEXT,
       photo             TEXT,
-      raw               TEXT,             -- full payload, verbatim
-      first_seen_at     TEXT NOT NULL,
-      last_seen_at      TEXT NOT NULL,
-      delisted_at       TEXT
+      raw               JSONB,
+      first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_seen_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      delisted_at       TIMESTAMPTZ
     );
 
-    -- VIN dedup for relistings (§5). Partial index: many rows legitimately
-    -- have no VIN, and those must not collide with each other.
-    CREATE UNIQUE INDEX IF NOT EXISTS vehicle_vin_uniq
-      ON vehicle (vin) WHERE vin IS NOT NULL;
+    -- VIN dedup for relistings (§5). Partial: many rows legitimately have no
+    -- VIN, and those must not collide with one another.
+    CREATE UNIQUE INDEX IF NOT EXISTS vehicle_vin_uniq ON vehicle (vin) WHERE vin IS NOT NULL;
     CREATE INDEX IF NOT EXISTS vehicle_open ON vehicle (delisted_at);
 
     -- Immutable. One row per evaluation; re-runs append. Never updated.
     CREATE TABLE IF NOT EXISTS assessment (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      vehicle_id      TEXT NOT NULL REFERENCES vehicle(id),
-      assessed_at     TEXT NOT NULL,
-      config_version  TEXT NOT NULL,
-      gate            TEXT NOT NULL,
-      title_status    TEXT NOT NULL,
-      gate_reason     TEXT,
-      vision_json     TEXT,
-      action          TEXT NOT NULL,
-      fleet_ready_value INTEGER,
-      repair_estimate INTEGER,
-      max_bid         INTEGER,
-      margin_aed      INTEGER,
-      reasons         TEXT
+      id                BIGGENERATED,
+      vehicle_id        TEXT NOT NULL REFERENCES vehicle(id),
+      assessed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      config_version    TEXT NOT NULL,
+      gate              TEXT NOT NULL,
+      title_status      TEXT NOT NULL,
+      gate_reason       TEXT,
+      vision_json       JSONB,
+      action            TEXT NOT NULL,
+      fleet_ready_value BIGINT,
+      repair_estimate   BIGINT,
+      max_bid           BIGINT,
+      margin_aed        BIGINT,
+      reasons           JSONB
     );
     CREATE INDEX IF NOT EXISTS assessment_vehicle ON assessment (vehicle_id, assessed_at);
 
-    -- Outcome + floor only, until §8 capture lands. Never a sale price.
     CREATE TABLE IF NOT EXISTS price_history (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      id            BIGGENERATED,
       vehicle_id    TEXT NOT NULL REFERENCES vehicle(id),
-      observed_at   TEXT NOT NULL,
-      starting_bid  INTEGER,
+      observed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      starting_bid  BIGINT,
       status        TEXT,
       auction_id    TEXT
     );
@@ -93,56 +109,52 @@ function migrate(d: DB): void {
     CREATE TABLE IF NOT EXISTS watchlist (
       vehicle_id   TEXT PRIMARY KEY REFERENCES vehicle(id),
       auction_id   TEXT,
-      lot_no       INTEGER,
+      lot_no       BIGINT,
       lane         TEXT,
       sequence_no  INTEGER,
-      max_bid      INTEGER,
-      added_at     TEXT NOT NULL,
-      resolved_at  TEXT,
+      max_bid      BIGINT,
+      added_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      resolved_at  TIMESTAMPTZ,
       outcome      TEXT
     );
     CREATE INDEX IF NOT EXISTS watchlist_open ON watchlist (auction_id, resolved_at);
 
     -- amount IS NULL ⇒ gap_reason populated. A lot is never omitted (§8.4).
     CREATE TABLE IF NOT EXISTS bid_observation (
-      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      id           BIGGENERATED,
       vehicle_id   TEXT NOT NULL REFERENCES vehicle(id),
       auction_id   TEXT,
       lane         TEXT,
-      observed_at  TEXT NOT NULL,
-      amount       INTEGER,
-      source       TEXT NOT NULL,        -- socket | poll | invoice
+      observed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      amount       BIGINT,
+      source       TEXT NOT NULL,
       gap_reason   TEXT,
-      CHECK (amount IS NOT NULL OR gap_reason IS NOT NULL)
+      CONSTRAINT amount_or_gap CHECK (amount IS NOT NULL OR gap_reason IS NOT NULL)
     );
     CREATE INDEX IF NOT EXISTS bid_observation_auction ON bid_observation (auction_id);
 
     CREATE TABLE IF NOT EXISTS sitemap_snapshot (
-      lot_id     TEXT PRIMARY KEY,
-      url        TEXT NOT NULL,
-      seen_on    TEXT NOT NULL
+      lot_id   TEXT PRIMARY KEY,
+      url      TEXT NOT NULL,
+      seen_on  DATE NOT NULL
     );
 
     -- Prevents re-reporting a lot as NEW on a same-day re-run (§12).
     CREATE TABLE IF NOT EXISTS digest_log (
-      vehicle_id     TEXT NOT NULL,
-      first_sent_on  TEXT NOT NULL,
-      last_sent_on   TEXT NOT NULL,
-      PRIMARY KEY (vehicle_id)
+      vehicle_id     TEXT PRIMARY KEY,
+      first_sent_on  DATE NOT NULL,
+      last_sent_on   DATE NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS run_log (
-      id           INTEGER PRIMARY KEY AUTOINCREMENT,
-      started_at   TEXT NOT NULL,
-      finished_at  TEXT,
+      id           BIGGENERATED,
+      started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      finished_at  TIMESTAMPTZ,
       kind         TEXT NOT NULL,
-      stats_json   TEXT
+      stats_json   JSONB
     );
-  `);
+  `.replace(/BIGGENERATED/g, 'BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY'));
 }
-
-export const nowIso = (): string => new Date().toISOString();
-export const today = (): string => new Date().toISOString().slice(0, 10);
 
 // ── vehicle ────────────────────────────────────────────────────────────────
 
@@ -173,64 +185,50 @@ export interface VehicleUpsert {
  * different lot id, the existing row is refreshed and its id returned — a
  * relisting is the same car, not new inventory (§5).
  */
-export function upsertVehicle(v: VehicleUpsert): string {
-  const d = db();
-  const ts = nowIso();
-
+export async function upsertVehicle(v: VehicleUpsert): Promise<string> {
   const existing = v.vin
-    ? (d.prepare(`SELECT id FROM vehicle WHERE vin = ?`).get(v.vin) as { id: string } | undefined)
-    : undefined;
-  const canonicalId = existing?.id ?? v.id;
+    ? await q<{ id: string }>(`SELECT id FROM vehicle WHERE vin = $1`, [v.vin])
+    : [];
+  const canonicalId = existing[0]?.id ?? v.id;
 
-  d.prepare(
+  await q(
     `INSERT INTO vehicle (
        id, vin, lot_no, url, make, model, model_key, year, description,
        starting_bid, clean_title, primary_damage, secondary_damage, start_code,
        mileage_km, auction_id, lane, photo, raw, first_seen_at, last_seen_at, delisted_at
-     ) VALUES (
-       @id, @vin, @lotNo, @url, @make, @model, @modelKey, @year, @description,
-       @startingBid, @cleanTitle, @primaryDamage, @secondaryDamage, @startCode,
-       @mileageKm, @auctionId, @lane, @photo, @raw, @ts, @ts, NULL
-     )
-     ON CONFLICT(id) DO UPDATE SET
-       vin = COALESCE(excluded.vin, vehicle.vin),
-       lot_no = excluded.lot_no,
-       url = excluded.url,
-       starting_bid = excluded.starting_bid,
-       clean_title = excluded.clean_title,
-       primary_damage = excluded.primary_damage,
-       secondary_damage = excluded.secondary_damage,
-       start_code = excluded.start_code,
-       mileage_km = excluded.mileage_km,
-       auction_id = excluded.auction_id,
-       lane = excluded.lane,
-       photo = COALESCE(excluded.photo, vehicle.photo),
-       raw = excluded.raw,
-       last_seen_at = excluded.last_seen_at,
-       delisted_at = NULL`,
-  ).run({
-    ...v,
-    id: canonicalId,
-    cleanTitle: v.cleanTitle === undefined ? null : v.cleanTitle ? 1 : 0,
-    raw: JSON.stringify(v.raw),
-    ts,
-  });
-
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,now(),now(),NULL)
+     ON CONFLICT (id) DO UPDATE SET
+       vin              = COALESCE(EXCLUDED.vin, vehicle.vin),
+       lot_no           = EXCLUDED.lot_no,
+       url              = EXCLUDED.url,
+       starting_bid     = EXCLUDED.starting_bid,
+       clean_title      = EXCLUDED.clean_title,
+       primary_damage   = EXCLUDED.primary_damage,
+       secondary_damage = EXCLUDED.secondary_damage,
+       start_code       = EXCLUDED.start_code,
+       mileage_km       = EXCLUDED.mileage_km,
+       auction_id       = EXCLUDED.auction_id,
+       lane             = EXCLUDED.lane,
+       photo            = COALESCE(EXCLUDED.photo, vehicle.photo),
+       raw              = EXCLUDED.raw,
+       last_seen_at     = now(),
+       delisted_at      = NULL`,
+    [
+      canonicalId, v.vin, v.lotNo, v.url, v.make, v.model, v.modelKey, v.year, v.description,
+      v.startingBid, v.cleanTitle ?? null, v.primaryDamage, v.secondaryDamage, v.startCode,
+      v.mileageKm, v.auctionId, v.lane, v.photo, JSON.stringify(v.raw ?? null),
+    ],
+  );
   return canonicalId;
 }
 
-export function markDelisted(ids: readonly string[]): void {
+export async function markDelisted(ids: readonly string[]): Promise<void> {
   if (ids.length === 0) return;
-  const d = db();
-  const stmt = d.prepare(`UPDATE vehicle SET delisted_at = ? WHERE id = ? AND delisted_at IS NULL`);
-  const ts = nowIso();
-  d.transaction(() => ids.forEach((id) => stmt.run(ts, id)))();
+  await q(`UPDATE vehicle SET delisted_at = now() WHERE id = ANY($1) AND delisted_at IS NULL`, [ids]);
 }
 
-export function openVehicleIds(): string[] {
-  return (db().prepare(`SELECT id FROM vehicle WHERE delisted_at IS NULL`).all() as { id: string }[]).map(
-    (r) => r.id,
-  );
+export async function knownVehicleIds(): Promise<Set<string>> {
+  return new Set((await q<{ id: string }>(`SELECT id FROM vehicle`)).map((r) => r.id));
 }
 
 // ── assessment (append-only) ───────────────────────────────────────────────
@@ -250,39 +248,32 @@ export interface AssessmentRow {
   reasons: readonly string[];
 }
 
-export function appendAssessment(a: AssessmentRow): void {
-  db()
-    .prepare(
-      `INSERT INTO assessment (
-         vehicle_id, assessed_at, config_version, gate, title_status, gate_reason,
-         vision_json, action, fleet_ready_value, repair_estimate, max_bid, margin_aed, reasons
-       ) VALUES (
-         @vehicleId, @assessedAt, @configVersion, @gate, @titleStatus, @gateReason,
-         @visionJson, @action, @fleetReadyValue, @repairEstimate, @maxBid, @marginAed, @reasons
-       )`,
-    )
-    .run({
-      ...a,
-      assessedAt: nowIso(),
-      visionJson: a.vision ? JSON.stringify(a.vision) : null,
-      reasons: JSON.stringify(a.reasons),
-    });
+export async function appendAssessment(a: AssessmentRow): Promise<void> {
+  await q(
+    `INSERT INTO assessment (
+       vehicle_id, config_version, gate, title_status, gate_reason,
+       vision_json, action, fleet_ready_value, repair_estimate, max_bid, margin_aed, reasons
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [
+      a.vehicleId, a.configVersion, a.gate, a.titleStatus, a.gateReason,
+      a.vision ? JSON.stringify(a.vision) : null, a.action,
+      a.fleetReadyValue, a.repairEstimate, a.maxBid, a.marginAed, JSON.stringify(a.reasons),
+    ],
+  );
 }
 
 // ── price_history ──────────────────────────────────────────────────────────
 
-export function recordPriceState(
+export async function recordPriceState(
   vehicleId: string,
   startingBid: number | null,
   status: string | null,
   auctionId: string | null,
-): void {
-  db()
-    .prepare(
-      `INSERT INTO price_history (vehicle_id, observed_at, starting_bid, status, auction_id)
-       VALUES (?, ?, ?, ?, ?)`,
-    )
-    .run(vehicleId, nowIso(), startingBid, status, auctionId);
+): Promise<void> {
+  await q(
+    `INSERT INTO price_history (vehicle_id, starting_bid, status, auction_id) VALUES ($1,$2,$3,$4)`,
+    [vehicleId, startingBid, status, auctionId],
+  );
 }
 
 // ── watchlist / bid_observation ────────────────────────────────────────────
@@ -296,19 +287,18 @@ export interface WatchlistEntry {
   maxBid: number | null;
 }
 
-export function addToWatchlist(e: WatchlistEntry): void {
-  db()
-    .prepare(
-      `INSERT INTO watchlist (vehicle_id, auction_id, lot_no, lane, sequence_no, max_bid, added_at)
-       VALUES (@vehicleId, @auctionId, @lotNo, @lane, @sequenceNo, @maxBid, @addedAt)
-       ON CONFLICT(vehicle_id) DO UPDATE SET
-         auction_id = excluded.auction_id,
-         lot_no = excluded.lot_no,
-         lane = excluded.lane,
-         sequence_no = excluded.sequence_no,
-         max_bid = excluded.max_bid`,
-    )
-    .run({ ...e, addedAt: nowIso() });
+export async function addToWatchlist(e: WatchlistEntry): Promise<void> {
+  await q(
+    `INSERT INTO watchlist (vehicle_id, auction_id, lot_no, lane, sequence_no, max_bid)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (vehicle_id) DO UPDATE SET
+       auction_id  = EXCLUDED.auction_id,
+       lot_no      = EXCLUDED.lot_no,
+       lane        = EXCLUDED.lane,
+       sequence_no = EXCLUDED.sequence_no,
+       max_bid     = EXCLUDED.max_bid`,
+    [e.vehicleId, e.auctionId, e.lotNo, e.lane, e.sequenceNo, e.maxBid],
+  );
 }
 
 export interface WatchTarget {
@@ -320,16 +310,19 @@ export interface WatchTarget {
   max_bid: number | null;
 }
 
-export function watchlistFor(auctionId: string): WatchTarget[] {
-  return db()
-    .prepare(`SELECT * FROM watchlist WHERE auction_id = ? AND resolved_at IS NULL`)
-    .all(auctionId) as WatchTarget[];
+export async function watchlistFor(auctionId: string): Promise<WatchTarget[]> {
+  return q<WatchTarget>(
+    `SELECT vehicle_id, auction_id, lot_no, lane, sequence_no, max_bid
+     FROM watchlist WHERE auction_id = $1 AND resolved_at IS NULL`,
+    [auctionId],
+  );
 }
 
-export function resolveWatch(vehicleId: string, outcome: string): void {
-  db()
-    .prepare(`UPDATE watchlist SET resolved_at = ?, outcome = ? WHERE vehicle_id = ?`)
-    .run(nowIso(), outcome, vehicleId);
+export async function resolveWatch(vehicleId: string, outcome: string): Promise<void> {
+  await q(`UPDATE watchlist SET resolved_at = now(), outcome = $2 WHERE vehicle_id = $1`, [
+    vehicleId,
+    outcome,
+  ]);
 }
 
 export interface Observation {
@@ -342,13 +335,12 @@ export interface Observation {
 }
 
 /** A lot the watcher failed to observe is written with amount NULL (§8.4). */
-export function recordObservation(o: Observation): void {
-  db()
-    .prepare(
-      `INSERT INTO bid_observation (vehicle_id, auction_id, lane, observed_at, amount, source, gap_reason)
-       VALUES (@vehicleId, @auctionId, @lane, @observedAt, @amount, @source, @gapReason)`,
-    )
-    .run({ ...o, observedAt: nowIso() });
+export async function recordObservation(o: Observation): Promise<void> {
+  await q(
+    `INSERT INTO bid_observation (vehicle_id, auction_id, lane, amount, source, gap_reason)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [o.vehicleId, o.auctionId, o.lane, o.amount, o.source, o.gapReason],
+  );
 }
 
 export interface CaptureReport {
@@ -359,91 +351,86 @@ export interface CaptureReport {
 }
 
 /** Treat capture rate as the system health metric; distrust comps below it (§8.4). */
-export function captureReport(auctionId: string): CaptureReport {
-  const d = db();
-  const targets = (
-    d.prepare(`SELECT COUNT(*) n FROM watchlist WHERE auction_id = ?`).get(auctionId) as { n: number }
-  ).n;
-  const captured = (
-    d
-      .prepare(
-        `SELECT COUNT(DISTINCT vehicle_id) n FROM bid_observation
-         WHERE auction_id = ? AND amount IS NOT NULL`,
-      )
-      .get(auctionId) as { n: number }
-  ).n;
-  const gaps = (
-    d
-      .prepare(
-        `SELECT COUNT(DISTINCT vehicle_id) n FROM bid_observation
-         WHERE auction_id = ? AND amount IS NULL`,
-      )
-      .get(auctionId) as { n: number }
-  ).n;
-  return { targets, captured, gaps, rate: targets ? captured / targets : null };
+export async function captureReport(auctionId: string): Promise<CaptureReport> {
+  const [row] = await q<{ targets: string; captured: string; gaps: string }>(
+    `SELECT
+       (SELECT COUNT(*) FROM watchlist WHERE auction_id = $1) AS targets,
+       (SELECT COUNT(DISTINCT vehicle_id) FROM bid_observation
+          WHERE auction_id = $1 AND amount IS NOT NULL) AS captured,
+       (SELECT COUNT(DISTINCT vehicle_id) FROM bid_observation
+          WHERE auction_id = $1 AND amount IS NULL) AS gaps`,
+    [auctionId],
+  );
+  const targets = Number(row?.targets ?? 0);
+  const captured = Number(row?.captured ?? 0);
+  return { targets, captured, gaps: Number(row?.gaps ?? 0), rate: targets ? captured / targets : null };
 }
 
-export function latestCaptureRate(): number | null {
-  const row = db()
-    .prepare(
-      `SELECT auction_id FROM watchlist
-       WHERE auction_id IS NOT NULL
-       ORDER BY added_at DESC LIMIT 1`,
-    )
-    .get() as { auction_id: string } | undefined;
-  return row ? captureReport(row.auction_id).rate : null;
+export async function latestCaptureRate(): Promise<number | null> {
+  const [row] = await q<{ auction_id: string }>(
+    `SELECT auction_id FROM watchlist WHERE auction_id IS NOT NULL ORDER BY added_at DESC LIMIT 1`,
+  );
+  return row ? (await captureReport(row.auction_id)).rate : null;
 }
 
 // ── sitemap_snapshot ───────────────────────────────────────────────────────
 
-export function previousSnapshot(): Map<string, string> {
-  const rows = db().prepare(`SELECT lot_id, url FROM sitemap_snapshot`).all() as {
-    lot_id: string;
-    url: string;
-  }[];
+export async function previousSnapshot(): Promise<Map<string, string>> {
+  const rows = await q<{ lot_id: string; url: string }>(`SELECT lot_id, url FROM sitemap_snapshot`);
   return new Map(rows.map((r) => [r.lot_id, r.url]));
 }
 
-export function writeSnapshot(lots: readonly { id: string; url: string }[]): void {
-  const d = db();
-  const seen = today();
-  d.transaction(() => {
-    d.prepare(`DELETE FROM sitemap_snapshot`).run();
-    const stmt = d.prepare(`INSERT OR REPLACE INTO sitemap_snapshot (lot_id, url, seen_on) VALUES (?, ?, ?)`);
-    for (const l of lots) stmt.run(l.id, l.url, seen);
-  })();
+export async function writeSnapshot(lots: readonly { id: string; url: string }[]): Promise<void> {
+  const client: PoolClient = await db().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM sitemap_snapshot');
+    // One statement rather than N round trips — a full catalogue is thousands.
+    for (let i = 0; i < lots.length; i += 500) {
+      const chunk = lots.slice(i, i + 500);
+      const values = chunk.map((_, k) => `($${k * 2 + 1}, $${k * 2 + 2}, CURRENT_DATE)`).join(',');
+      await client.query(
+        `INSERT INTO sitemap_snapshot (lot_id, url, seen_on) VALUES ${values}
+         ON CONFLICT (lot_id) DO UPDATE SET url = EXCLUDED.url, seen_on = EXCLUDED.seen_on`,
+        chunk.flatMap((l) => [l.id, l.url]),
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ── digest_log ─────────────────────────────────────────────────────────────
 
-/**
- * True the first time a lot appears in a digest. Re-running the same day
- * does not re-badge it as NEW (§12).
- */
-export function isFirstAppearance(vehicleId: string): boolean {
-  return !db().prepare(`SELECT 1 FROM digest_log WHERE vehicle_id = ?`).get(vehicleId);
+/** True the first time a lot appears in a digest; re-runs do not re-badge (§12). */
+export async function isFirstAppearance(vehicleId: string): Promise<boolean> {
+  return (await q(`SELECT 1 FROM digest_log WHERE vehicle_id = $1`, [vehicleId])).length === 0;
 }
 
-export function recordDigestAppearance(ids: readonly string[]): void {
+export async function recordDigestAppearance(ids: readonly string[]): Promise<void> {
   if (ids.length === 0) return;
-  const d = db();
-  const day = today();
-  const stmt = d.prepare(
-    `INSERT INTO digest_log (vehicle_id, first_sent_on, last_sent_on) VALUES (?, ?, ?)
-     ON CONFLICT(vehicle_id) DO UPDATE SET last_sent_on = excluded.last_sent_on`,
+  await q(
+    `INSERT INTO digest_log (vehicle_id, first_sent_on, last_sent_on)
+     SELECT unnest($1::text[]), CURRENT_DATE, CURRENT_DATE
+     ON CONFLICT (vehicle_id) DO UPDATE SET last_sent_on = EXCLUDED.last_sent_on`,
+    [ids],
   );
-  d.transaction(() => ids.forEach((id) => stmt.run(id, day, day)))();
 }
 
 // ── run_log ────────────────────────────────────────────────────────────────
 
-export function startRun(kind: string): number {
-  const info = db().prepare(`INSERT INTO run_log (started_at, kind) VALUES (?, ?)`).run(nowIso(), kind);
-  return Number(info.lastInsertRowid);
+export async function startRun(kind: string): Promise<number> {
+  const [row] = await q<{ id: string }>(`INSERT INTO run_log (kind) VALUES ($1) RETURNING id`, [kind]);
+  return Number(row?.id ?? 0);
 }
 
-export function finishRun(id: number, stats: unknown): void {
-  db()
-    .prepare(`UPDATE run_log SET finished_at = ?, stats_json = ? WHERE id = ?`)
-    .run(nowIso(), JSON.stringify(stats), id);
+export async function finishRun(id: number, stats: unknown): Promise<void> {
+  await q(`UPDATE run_log SET finished_at = now(), stats_json = $2 WHERE id = $1`, [
+    id,
+    JSON.stringify(stats),
+  ]);
 }

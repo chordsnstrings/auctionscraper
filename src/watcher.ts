@@ -29,7 +29,15 @@ import {
   WATCHER_RECONNECT_BASE_MS,
   WATCHER_RECONNECT_MAX_MS,
 } from './config.js';
-import { captureReport, recordObservation, resolveWatch, watchlistFor, type WatchTarget } from './db.js';
+import {
+  captureReport,
+  closeDb,
+  migrate,
+  recordObservation,
+  resolveWatch,
+  watchlistFor,
+  type WatchTarget,
+} from './db.js';
 import { Fetcher } from './fetcher.js';
 import type { AuctionPayload } from './types.js';
 import * as ui from './ui.js';
@@ -82,8 +90,8 @@ class LaneWorker {
   ) {}
 
   /** Lots on this lane, re-read from the DB every poll — never cached (§8.5). */
-  private targets(): WatchTarget[] {
-    return watchlistFor(this.auctionId).filter((t) => (t.lane ?? '') === this.lane);
+  private async targets(): Promise<WatchTarget[]> {
+    return (await watchlistFor(this.auctionId)).filter((t) => (t.lane ?? '') === this.lane);
   }
 
   async run(stopAt: () => boolean): Promise<void> {
@@ -120,7 +128,7 @@ class LaneWorker {
       // Route 2: outcome capture from the polled state. This yields sold/unsold,
       // never a hammer price — the API does not expose one anonymously (§2.6),
       // and we do not infer, estimate or synthesise it (§13).
-      for (const t of this.targets()) {
+      for (const t of await this.targets()) {
         if (this.seen.has(t.vehicle_id)) continue;
         // A lot leaving the open watchlist while the lane is still running is
         // an outcome we can attribute; anything else waits for the sweep.
@@ -136,16 +144,16 @@ class LaneWorker {
       await sleep(WATCHER_POLL_MS);
     }
 
-    this.sweep();
+    await this.sweep();
   }
 
   /**
    * Close out the lane. Every remaining target gets a row — priced if the
    * socket parser produced one, gap-flagged otherwise. Never omitted (§8.4).
    */
-  private sweep(): void {
-    for (const t of this.targets()) {
-      recordObservation({
+  private async sweep(): Promise<void> {
+    for (const t of await this.targets()) {
+      await recordObservation({
         vehicleId: t.vehicle_id,
         auctionId: this.auctionId,
         lane: this.lane,
@@ -153,7 +161,7 @@ class LaneWorker {
         source: 'poll',
         gapReason: 'socket frame parser not implemented — no hammer price observed (§8.3 route 1)',
       });
-      resolveWatch(t.vehicle_id, 'unobserved');
+      await resolveWatch(t.vehicle_id, 'unobserved');
     }
   }
 }
@@ -162,6 +170,7 @@ class LaneWorker {
 
 async function watch(): Promise<void> {
   ui.banner('Live auction watcher', 'watchlist only · reports, never bids');
+  await migrate();
 
   if (!existsSync(SESSION_STATE_PATH)) {
     ui.warn(`no session at ${SESSION_STATE_PATH} — run "npm run login" first.`);
@@ -185,7 +194,7 @@ async function watch(): Promise<void> {
 
     for (const auction of active) {
       const id = auction._id;
-      const targets = watchlistFor(id);
+      const targets = await watchlistFor(id);
       if (targets.length === 0) {
         ui.note(`${auction.title ?? id}: nothing on the watchlist`);
         continue;
@@ -200,7 +209,7 @@ async function watch(): Promise<void> {
       const stop = () => Date.now() > deadline;
       await Promise.all(lanes.map((lane) => new LaneWorker(fetcher, id, lane).run(stop)));
 
-      const report = captureReport(id);
+      const report = await captureReport(id);
       ui.summary([
         ['auction', auction.title ?? id],
         ['targets', String(report.targets)],
@@ -215,6 +224,7 @@ async function watch(): Promise<void> {
     }
   } finally {
     await fetcher.close();
+    await closeDb();
   }
 
   void dumpFrame;

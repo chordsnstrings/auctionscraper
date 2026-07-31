@@ -11,7 +11,7 @@
  *   npm run calibrate -- --renders=400
  */
 import { MIN_MODEL_YEAR, TARGET_MODELS } from './config.js';
-import { finishRun, startRun } from './db.js';
+import { closeDb, finishRun, migrate, startRun } from './db.js';
 import { Fetcher } from './fetcher.js';
 import { gate, preGate } from './gates.js';
 import { diffSitemap } from './sitemap.js';
@@ -34,7 +34,8 @@ function sample<T>(items: readonly T[], n: number): T[] {
 
 async function calibrate(): Promise<void> {
   const renderBudget = arg('renders', 400);
-  const runId = startRun('calibrate');
+  await migrate();
+  const runId = await startRun('calibrate');
   ui.banner('Calibration crawl', 'gates on · vision off · no email');
 
   const walk = new ui.Progress('sitemap');
@@ -119,7 +120,7 @@ async function calibrate(): Promise<void> {
     ui.ok(`Clean-title share ${(share * 100).toFixed(1)}% — proceed to §11 step 2 (FLEET_READY_VALUES).`);
   }
 
-  finishRun(runId, {
+  await finishRun(runId, {
     total: diff.all.length,
     afterYear: afterYear.length,
     afterModel: afterModel.length,
@@ -130,6 +131,7 @@ async function calibrate(): Promise<void> {
     passed,
     unverified,
   });
+  await closeDb();
 }
 
 calibrate().catch((err: unknown) => {

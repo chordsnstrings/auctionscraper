@@ -21,8 +21,10 @@ import {
 import {
   addToWatchlist,
   appendAssessment,
-  db,
+  closeDb,
   finishRun,
+  knownVehicleIds,
+  migrate,
   isFirstAppearance,
   latestCaptureRate,
   markDelisted,
@@ -53,17 +55,16 @@ const passesYear = (l: LotRef): boolean => Number.isFinite(l.year) && l.year >= 
  * then a capped re-check of already-known open lots, preferring the ones we
  * have never successfully rendered.
  */
-function selectForRender(added: LotRef[], stillListed: LotRef[]): LotRef[] {
-  const known = new Set(
-    (db().prepare(`SELECT id FROM vehicle`).all() as { id: string }[]).map((r) => r.id),
-  );
+async function selectForRender(added: LotRef[], stillListed: LotRef[]): Promise<LotRef[]> {
+  const known = await knownVehicleIds();
   const recheck = [...stillListed].sort((a, b) => Number(known.has(a.id)) - Number(known.has(b.id)));
   return [...added, ...recheck.slice(0, RECHECK_CAP)].slice(0, MAX_RENDERS_PER_RUN);
 }
 
 export async function run(): Promise<void> {
   const startedAt = Date.now();
-  const runId = startRun('daily');
+  await migrate();
+  const runId = await startRun('daily');
   ui.banner('Daily purchasing screen', 'Al Qaryah Auction · Sharjah · single source');
 
   // ── 1. Sitemap diff ──────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ export async function run(): Promise<void> {
   const afterModel = diff.all.filter(preGate);
   ui.step('Pre-gate', `year → ${afterYear.length}, target models → ${afterModel.length}`);
 
-  const toRender = selectForRender(diff.added.filter(preGate), diff.stillListed.filter(preGate));
+  const toRender = await selectForRender(diff.added.filter(preGate), diff.stillListed.filter(preGate));
   ui.note(`${toRender.length} pages queued for render (cap ${MAX_RENDERS_PER_RUN})`);
 
   // ── 3. Fetch ─────────────────────────────────────────────────────────────
@@ -150,7 +151,7 @@ export async function run(): Promise<void> {
     const vision = visionResults.get(v.id) ?? null;
     const s = score(v, g, vision);
 
-    const vehicleId = upsertVehicle({
+    const vehicleId = await upsertVehicle({
       id: v.id,
       vin: v.vin,
       lotNo: v.lotNo,
@@ -173,9 +174,9 @@ export async function run(): Promise<void> {
     });
 
     // Outcome + floor only. Never a sale price (§2.6).
-    recordPriceState(vehicleId, v.startingBid, v.auctionVehicleStatus, v.auctionId);
+    await recordPriceState(vehicleId, v.startingBid, v.auctionVehicleStatus, v.auctionId);
 
-    appendAssessment({
+    await appendAssessment({
       vehicleId,
       configVersion: CONFIG_VERSION,
       gate: g.verdict,
@@ -208,14 +209,14 @@ export async function run(): Promise<void> {
       score: s,
       lane: v.lane,
       closesAt: v.auctionId ? auctionCloses.get(v.auctionId) ?? null : null,
-      isNew: isFirstAppearance(vehicleId),
+      isNew: await isFirstAppearance(vehicleId),
       photo: v.photos[0] ?? null,
     };
 
     (s.action === 'BID' ? bid : inspect).push(lot);
 
     // Every lot reaching BID or INSPECT goes on the watchlist (§8.2).
-    addToWatchlist({
+    await addToWatchlist({
       vehicleId,
       auctionId: v.auctionId,
       lotNo: v.lotNo,
@@ -245,7 +246,7 @@ export async function run(): Promise<void> {
     inspect,
     funnel,
     stalenessWarnings: stalenessWarnings(),
-    captureRate: latestCaptureRate(),
+    captureRate: await latestCaptureRate(),
     configVersion: CONFIG_VERSION,
     runDurationMs: Date.now() - startedAt,
   };
@@ -253,12 +254,13 @@ export async function run(): Promise<void> {
   const outcome = await sendDigest(model);
   // Only after the digest is out — otherwise a failed send would silently burn
   // the NEW badge for every lot in it.
-  recordDigestAppearance([...bid, ...inspect].map((l) => l.id));
+  await recordDigestAppearance([...bid, ...inspect].map((l) => l.id));
 
   // ── 8. Snapshot + housekeeping ──────────────────────────────────────────
-  markDelisted(diff.removedIds);
-  commitSnapshot(diff);
-  finishRun(runId, funnel);
+  await markDelisted(diff.removedIds);
+  await commitSnapshot(diff);
+  await finishRun(runId, funnel);
+  await closeDb();
 
   ui.funnel([
     { label: 'sitemap', n: funnel.sitemapTotal },

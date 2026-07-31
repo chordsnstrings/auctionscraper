@@ -21,8 +21,13 @@ export const API_RESPONSE_PATTERN = /erpapiv1?\.alqaryahauction\.com/;
 // ── Crawl / render budget ───────────────────────────────────────────────────
 
 export const SITEMAP_DELAY_MS = 150;
-export const CONCURRENCY = 2;
-export const DELAY_MS = 1200;
+/**
+ * Parallel browser pages. Chromium peaks near 865 MB with a single page, so on
+ * the 1 GB App Platform container this stays at 1; raise it only on a box with
+ * headroom to spare.
+ */
+export const CONCURRENCY = Number(process.env.CONCURRENCY ?? 1);
+export const DELAY_MS = Number(process.env.DELAY_MS ?? 1200);
 
 /** Acceptance criterion: a full run renders no more than ~400 pages (§12). */
 export const MAX_RENDERS_PER_RUN = 400;
@@ -238,8 +243,15 @@ export const SMTP = {
 
 // ── Watcher (§8) ────────────────────────────────────────────────────────────
 
-export const SESSION_STATE_PATH = 'data/session.json';
-export const DB_PATH = 'data/ecosine.db';
+export const SESSION_STATE_PATH = process.env.SESSION_STATE_PATH ?? 'data/session.json';
+
+/**
+ * Postgres connection string. App Platform injects this from the attached
+ * database component as ${db.DATABASE_URL}; locally it comes from .env.
+ */
+export const DATABASE_URL = process.env.DATABASE_URL ?? '';
+/** Managed Postgres presents a CA the container does not carry. */
+export const DB_SSL = process.env.DB_SSL !== 'false' && /(^|[?&])sslmode=require/.test(DATABASE_URL);
 
 export const WATCHER_POLL_MS = 4_000;
 export const WATCHER_PAUSED_BACKOFF_MS = 30_000;

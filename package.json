@@ -16,13 +16,17 @@
     "watch": "tsx src/watcher.ts",
     "preview": "tsx src/preview.ts",
     "verify": "tsx src/verify.ts",
-    "check:responsive": "tsx src/preview.ts && tsx src/responsive.ts"
+    "check:responsive": "tsx src/preview.ts && tsx src/responsive.ts",
+    "preflight": "tsx src/preflight.ts",
+    "scheduler": "tsx src/scheduler.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
+    "@types/pg": "^8.20.0",
     "better-sqlite3": "^11.10.0",
     "dotenv": "^16.4.7",
     "nodemailer": "^6.10.0",
+    "pg": "^8.22.0",
     "playwright": "^1.50.0",
     "zod": "^3.24.1"
   },

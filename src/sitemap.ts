@@ -123,7 +123,7 @@ export async function walkSitemap(opts: WalkOptions = {}): Promise<LotRef[]> {
 /** Compare against yesterday's index and emit the diff (§6.1). */
 export async function diffSitemap(opts: WalkOptions = {}): Promise<SitemapDiff> {
   const all = await walkSitemap(opts);
-  const prev = previousSnapshot();
+  const prev = await previousSnapshot();
   const current = new Set(all.map((l) => l.id));
 
   const added = all.filter((l) => !prev.has(l.id));
@@ -133,6 +133,6 @@ export async function diffSitemap(opts: WalkOptions = {}): Promise<SitemapDiff> 
   return { added, stillListed, removedIds, all };
 }
 
-export function commitSnapshot(diff: SitemapDiff): void {
-  writeSnapshot(diff.all);
+export async function commitSnapshot(diff: SitemapDiff): Promise<void> {
+  await writeSnapshot(diff.all);
 }
