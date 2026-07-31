@@ -17,6 +17,8 @@ import {
   MIN_MODEL_YEAR,
   RECHECK_CAP,
   VISION_ENABLED,
+  VISION_MODEL,
+  VISION_PROVIDER,
 } from './config.js';
 import {
   addToWatchlist,
@@ -106,7 +108,6 @@ export async function run(): Promise<void> {
     fetchBar.update(done, toRender.length, 'detail pages'),
   );
   fetchBar.done(`${vehicles.length}/${toRender.length} payloads captured`);
-  await fetcher.close();
 
   // ── 4. Gate (free) ───────────────────────────────────────────────────────
   const gated = vehicles.map((v) => ({ v, g: gate(v) }));
@@ -124,23 +125,33 @@ export async function run(): Promise<void> {
   const visionResults = new Map<string, VisionResult>();
   let visionCalls = 0;
 
-  if (VISION_ENABLED && survivors.length > 0) {
-    const bar = new ui.Progress('vision');
-    for (const [i, s] of survivors.entries()) {
-      try {
-        const result = await assess(s.v);
-        if (result) {
-          visionResults.set(s.v.id, result);
-          visionCalls += 1;
+  // The browser stays open through this stage and is closed in `finally`:
+  // photos are pulled through its context so the vision provider is shown
+  // bytes rather than a URL its own egress may not be allowed to fetch (§2.1).
+  // A leaked Chromium would keep the process alive after the digest went out.
+  try {
+    if (VISION_ENABLED && survivors.length > 0) {
+      ui.note(`vision provider ${VISION_PROVIDER} · ${VISION_MODEL}`);
+      const loadPhoto = fetcher.photoLoader();
+      const bar = new ui.Progress('vision');
+      for (const [i, s] of survivors.entries()) {
+        try {
+          const result = await assess(s.v, loadPhoto);
+          if (result) {
+            visionResults.set(s.v.id, result);
+            visionCalls += 1;
+          }
+        } catch (err) {
+          ui.warn(`vision failed for ${s.v.id}: ${(err as Error).message}`);
         }
-      } catch (err) {
-        ui.warn(`vision failed for ${s.v.id}: ${(err as Error).message}`);
+        bar.update(i + 1, survivors.length, 'lots assessed');
       }
-      bar.update(i + 1, survivors.length, 'lots assessed');
+      bar.done(`${visionCalls} assessed`);
+    } else if (!VISION_ENABLED) {
+      ui.note('vision disabled (VISION_ENABLED=false)');
     }
-    bar.done(`${visionCalls} assessed`);
-  } else if (!VISION_ENABLED) {
-    ui.note('vision disabled (VISION_ENABLED=false)');
+  } finally {
+    await fetcher.close().catch(() => undefined);
   }
 
   // ── 6. Score + persist ───────────────────────────────────────────────────

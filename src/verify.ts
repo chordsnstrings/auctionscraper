@@ -9,27 +9,46 @@
  */
 import assert from 'node:assert/strict';
 import { auctionRoomUrl, decodeFrame, extractObservations } from './auctionroom.js';
-import { MAX_RENDERS_PER_RUN, MIN_MODEL_YEAR } from './config.js';
+import {
+  ANTHROPIC_VISION_MODEL,
+  ARK_VISION_MODEL,
+  CONFIG_VERSION,
+  MAX_RENDERS_PER_RUN,
+  MIN_MODEL_YEAR,
+  VISION_MODEL,
+  VISION_PROVIDER,
+} from './config.js';
 import { renderDigest } from './digest.js';
 import { MOTION_CSS, stagger } from './digest/motion.js';
 import { gate, preGate } from './gates.js';
 import { coerceYear, normalise, normaliseDamage, toKm } from './normalise.js';
+import { sniffMime } from './photos.js';
 import { modelKey, parseDetailUrl } from './sitemap.js';
 import { computeMaxBid, fleetReadyValue, score } from './scoring.js';
 import type { DigestLot, DigestModel, GateResult, LotRef, VehiclePayload, VisionResult } from './types.js';
 import * as ui from './ui.js';
+import { arkJsonSchema, assess, DamageAssessment, VisionError } from './vision.js';
 
 let passed = 0;
 const failures: string[] = [];
+/** Async checks are awaited before the report; a rejected one must not slip past. */
+const pending: Promise<void>[] = [];
 
-function check(name: string, fn: () => void): void {
-  try {
-    fn();
+function check(name: string, fn: () => void | Promise<void>): void {
+  const pass = (): void => {
     passed += 1;
     ui.note(`${ui.c.good('✓')} ${name}`);
-  } catch (err) {
+  };
+  const fail = (err: unknown): void => {
     failures.push(`${name}: ${(err as Error).message}`);
     ui.note(`${ui.c.bad('✕')} ${name} — ${(err as Error).message}`);
+  };
+  try {
+    const result = fn();
+    if (result instanceof Promise) pending.push(result.then(pass, fail));
+    else pass();
+  } catch (err) {
+    fail(err);
   }
 }
 
@@ -449,6 +468,69 @@ check('§8.3 the room URL is built for the lane', () => {
   );
 });
 
+// ── vision provider (§6.5) ─────────────────────────────────────────────────
+
+check('§6.5 the ModelArk schema is strict: every field required, nothing extra', () => {
+  const s = arkJsonSchema() as { required?: string[]; additionalProperties?: boolean; properties?: object };
+  const props = Object.keys(s.properties ?? {});
+  assert.equal(s.additionalProperties, false, 'a provider must not invent fields');
+  assert.deepEqual([...(s.required ?? [])].sort(), props.sort(), 'every field is required');
+  assert.ok(props.includes('tier') && props.includes('repairHighAed') && props.includes('confidence'));
+});
+
+check('§6.5 the JSON schema carries no $schema — ModelArk strict mode rejects the dialect line', () => {
+  assert.ok(!('$schema' in arkJsonSchema()));
+});
+
+check('§6.5 both providers are held to the same assessment shape', () => {
+  const wellFormed = {
+    tier: 3,
+    structural: true,
+    floodIndicators: false,
+    airbagsDeployed: true,
+    repairLowAed: 100,
+    repairMidAed: 200,
+    repairHighAed: 300,
+    confidence: 0.8,
+    notes: 'x',
+  };
+  assert.ok(DamageAssessment.safeParse(wellFormed).success);
+  // The failure that matters: a plausible-looking reply that is out of range.
+  assert.ok(!DamageAssessment.safeParse({ ...wellFormed, tier: 7 }).success, 'tier 7 is not an assessment');
+  assert.ok(!DamageAssessment.safeParse({ ...wellFormed, confidence: 1.4 }).success);
+  assert.ok(!DamageAssessment.safeParse({ ...wellFormed, repairMidAed: 'lots' }).success);
+});
+
+check('§1.4 photo bytes are sniffed, and a declared Content-Type is never trusted', () => {
+  assert.equal(sniffMime(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10])), 'image/jpeg');
+  assert.equal(sniffMime(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00])), 'image/png');
+  // The one that matters: Cloudflare serves its challenge with whatever
+  // Content-Type it likes, and a paid assessment of an HTML page is worse than
+  // no assessment at all.
+  assert.equal(sniffMime(Buffer.from('<!doctype html><title>Attention Required</title>')), null);
+  assert.equal(sniffMime(Buffer.from('{"error":"forbidden"}')), null);
+});
+
+check('§1.4 a lot whose photos all fail to load is an error, not a clean car', async () => {
+  const v = { photos: ['https://example.invalid/a.jpg'] } as never;
+  await assert.rejects(
+    () => assess(v, async () => null, 'modelark'),
+    (err: Error) => err instanceof VisionError && /no photo could be retrieved/.test(err.message),
+  );
+});
+
+check('§6.5 a lot with no photos returns null rather than an assessment', async () => {
+  assert.equal(await assess({ photos: [] } as never, async () => null, 'modelark'), null);
+});
+
+check('§5 CONFIG_VERSION covers the vision provider, so a switch re-versions assessments', () => {
+  // The hash is over VISION_PROVIDER and the effective VISION_MODEL; the model
+  // id differs per provider, so the two can never share a config version.
+  assert.notEqual(ARK_VISION_MODEL, ANTHROPIC_VISION_MODEL);
+  assert.equal(VISION_MODEL, VISION_PROVIDER === 'modelark' ? ARK_VISION_MODEL : ANTHROPIC_VISION_MODEL);
+  assert.match(CONFIG_VERSION, /^[0-9a-f]{12}$/);
+});
+
 // ── budget ─────────────────────────────────────────────────────────────────
 
 check('§12 the render budget is capped at ~400 pages', () => {
@@ -456,6 +538,8 @@ check('§12 the render budget is capped at ~400 pages', () => {
 });
 
 // ── report ─────────────────────────────────────────────────────────────────
+
+await Promise.all(pending);
 
 ui.summary([
   ['checks passed', String(passed)],

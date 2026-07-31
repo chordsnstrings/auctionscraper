@@ -21,6 +21,7 @@ import {
   SESSION_STATE_PATH,
 } from './config.js';
 import { normalise } from './normalise.js';
+import { browserPhotoLoader, httpPhotoLoader, type PhotoLoader } from './photos.js';
 import type { AuctionPayload, LotRef, NormalisedVehicle, VehiclePayload } from './types.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -70,6 +71,22 @@ export class Fetcher {
   /** The live auction room opens its own pages against this context (§8.3). */
   browserContext(): BrowserContext {
     return this.ctx();
+  }
+
+  /**
+   * A photo loader bound to this context, for the vision stage.
+   *
+   * Images are aborted during render precisely so they cost nothing there —
+   * but the vision provider still has to be shown the bytes, and its own egress
+   * has no standing with Cloudflare. Fetching them through this context reuses
+   * the clearance the render already earned. Once the fetcher is closed the
+   * loader degrades to plain HTTP rather than throwing.
+   */
+  photoLoader(): PhotoLoader {
+    return async (url) => {
+      if (!this.context) return httpPhotoLoader(url);
+      return browserPhotoLoader(this.context.request)(url);
+    };
   }
 
   /**

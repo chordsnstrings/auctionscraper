@@ -14,12 +14,17 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import {
   API_ORIGIN,
+  ARK_API_KEY,
+  ARK_BASE_URL,
+  ARK_VISION_MODEL,
   BROWSER_HEADERS,
   DATABASE_URL,
   ROOT_SITEMAP,
   SITE_ORIGIN,
   SMTP,
   VISION_ENABLED,
+  VISION_MODEL,
+  VISION_PROVIDER,
 } from './config.js';
 import { closeDb, db, migrate } from './db.js';
 import * as ui from './ui.js';
@@ -145,16 +150,59 @@ async function checkDatabase(): Promise<void> {
   }
 }
 
-function checkConfig(): void {
-  const key = process.env.ANTHROPIC_API_KEY;
+/**
+ * Vision reachability, checked for real rather than by looking for a key.
+ *
+ * The ModelArk probe is free: it sends a deliberately invalid request and reads
+ * the error code back. `InvalidParameter` means the request got past auth and
+ * entitlement and died in validation — key good, model callable, egress open.
+ * `NotFound` means the key cannot call that model. Anything else is a network
+ * or auth problem. All three are worth knowing before a run spends money.
+ */
+async function checkVision(): Promise<void> {
   if (!VISION_ENABLED) {
     add({ name: 'vision', status: 'warn', detail: 'disabled — no repair estimates, all lots INSPECT', gating: false });
-  } else if (!key) {
-    add({ name: 'vision', status: 'fail', detail: 'ANTHROPIC_API_KEY not set', gating: false });
-  } else {
-    add({ name: 'vision', status: 'ok', detail: `key present (${key.slice(0, 7)}…)`, gating: false });
+    return;
   }
 
+  if (VISION_PROVIDER === 'anthropic') {
+    const key = process.env.ANTHROPIC_API_KEY;
+    add(
+      key
+        ? { name: 'vision', status: 'ok', detail: `anthropic · ${VISION_MODEL} · key present`, gating: false }
+        : { name: 'vision', status: 'fail', detail: 'ANTHROPIC_API_KEY not set', gating: false },
+    );
+    return;
+  }
+
+  if (!ARK_API_KEY) {
+    add({ name: 'vision', status: 'fail', detail: 'ARK_API_KEY not set', gating: false });
+    return;
+  }
+
+  try {
+    const res = await fetch(`${ARK_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ARK_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: ARK_VISION_MODEL, messages: [] }),
+      signal: AbortSignal.timeout(25_000),
+    });
+    const json = (await res.json().catch(() => ({}))) as { error?: { code?: string; message?: string } };
+    const code = json.error?.code ?? String(res.status);
+
+    if (code === 'InvalidParameter') {
+      add({ name: 'vision', status: 'ok', detail: `modelark · ${ARK_VISION_MODEL} · callable`, gating: false });
+    } else if (code === 'InvalidEndpointOrModel.NotFound') {
+      add({ name: 'vision', status: 'fail', detail: `this key cannot call ${ARK_VISION_MODEL}`, gating: false });
+    } else {
+      add({ name: 'vision', status: 'fail', detail: `${code} ${(json.error?.message ?? '').slice(0, 50)}`, gating: false });
+    }
+  } catch (err) {
+    add({ name: 'vision', status: 'fail', detail: `modelark unreachable: ${(err as Error).message.slice(0, 50)}`, gating: false });
+  }
+}
+
+function checkConfig(): void {
   if (!SMTP.host || !SMTP.to) {
     add({ name: 'smtp', status: 'warn', detail: 'not configured — digest writes to disk instead', gating: false });
   } else {
@@ -166,6 +214,7 @@ async function main(): Promise<void> {
   ui.banner('Preflight', 'can this host actually run the screen?');
 
   await checkDatabase();
+  await checkVision();
   checkConfig();
   await checkHttp('plain fetch → sitemap', ROOT_SITEMAP, false);
   await checkHttp('plain fetch → api', `${API_ORIGIN}/auction/active-auctions`, false);

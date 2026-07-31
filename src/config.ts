@@ -131,16 +131,51 @@ export const RUN_AND_DRIVE_CODES: ReadonlySet<string> = new Set(['R & D', 'R&D',
 // ── Vision (§6.5) ───────────────────────────────────────────────────────────
 
 export const VISION_ENABLED = process.env.VISION_ENABLED !== 'false';
+
+/**
+ * Which vision provider assesses damage.
+ *
+ * ModelArk is the default: it is the account that actually holds a working key,
+ * it is roughly two orders of magnitude cheaper per lot than a frontier model,
+ * and the assessment it returns is a tier plus a repair range — a bounded,
+ * well-specified judgement rather than open-ended reasoning. Anthropic remains
+ * selectable for a side-by-side calibration run (§11 step 1), which is the one
+ * situation where paying frontier prices per lot is worth it.
+ */
+export type VisionProvider = 'modelark' | 'anthropic';
+export const VISION_PROVIDER: VisionProvider =
+  process.env.VISION_PROVIDER === 'anthropic' ? 'anthropic' : 'modelark';
+
+/** BytePlus ModelArk, OpenAI-compatible surface. Singapore endpoint by default. */
+export const ARK_BASE_URL = (
+  process.env.ARK_BASE_URL ?? 'https://ark.ap-southeast.bytepluses.com/api/v3'
+).replace(/\/+$/, '');
+export const ARK_API_KEY = process.env.ARK_API_KEY ?? '';
+/** Seed 2.0 Pro: image understanding, strict JSON schema output, adaptive reasoning. */
+export const ARK_VISION_MODEL = process.env.ARK_VISION_MODEL ?? 'seed-2-0-pro-260328';
+export const ANTHROPIC_VISION_MODEL = 'claude-opus-5';
+
 /**
  * Vision is the only paid stage and must never see a lot a free check could
- * have killed (§3). Damage assessment sets the repair estimate that the bid
- * ceiling is solved against, so this runs on the most capable model.
+ * have killed (§3). The effective model id is hashed into CONFIG_VERSION, so
+ * switching provider re-versions every assessment written afterwards.
  */
-export const VISION_MODEL = 'claude-opus-5';
+export const VISION_MODEL = VISION_PROVIDER === 'modelark' ? ARK_VISION_MODEL : ANTHROPIC_VISION_MODEL;
 export const VISION_EFFORT: 'low' | 'medium' | 'high' | 'xhigh' | 'max' = 'medium';
 export const VISION_MAX_TOKENS = 8_000;
 export const VISION_MAX_PHOTOS = 6;
 export const VISION_MIN_CONFIDENCE = 0.55;
+/** Transient ModelArk failures (429, 5xx, socket resets) are retried this many times. */
+export const VISION_RETRIES = 3;
+
+/**
+ * ModelArk fetches remote image URLs from its own egress, where the auction
+ * CDN's bot rules apply to a stranger rather than to our session. Photos are
+ * therefore inlined as base64 from inside this container, which is also the
+ * only route that works once Cloudflare is in play. These bound that.
+ */
+export const PHOTO_MAX_BYTES = 5_000_000;
+export const PHOTO_TIMEOUT_MS = 20_000;
 
 // ── Economics (§7) ──────────────────────────────────────────────────────────
 
@@ -282,6 +317,7 @@ export const CONFIG_VERSION: string = createHash('sha256')
       REPAIR_ESTIMATE_BASIS,
       MAX_DAMAGE_TIER,
       BID_ROUNDING_AED,
+      VISION_PROVIDER,
       VISION_MODEL,
       VISION_EFFORT,
       VISION_MIN_CONFIDENCE,

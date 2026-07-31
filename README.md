@@ -26,7 +26,7 @@ never sees a lot a free check could have killed.
 ```bash
 npm install
 npx playwright install chromium
-cp .env.example .env          # LLM + SMTP
+cp .env.example .env          # ARK_API_KEY + SMTP
 
 npm run calibrate             # §11 step 1 — do this FIRST
 npm run login                 # one-time, interactive, own credentials
@@ -98,6 +98,34 @@ assessment rather than duplicating inventory.
 
 ---
 
+## The vision stage
+
+Damage assessment runs on **BytePlus ModelArk** (`seed-2-0-pro-260328`) by
+default. It is the only per-lot cost in the pipeline, and what it is asked for
+is bounded and well specified — a tier, three flags, a repair range and a
+confidence — so it runs on the cheaper capable model rather than a frontier one.
+Set `VISION_PROVIDER=anthropic` to run the identical prompt and schema through
+Claude instead; that is worth paying for on a calibration run you intend to
+grade ModelArk against, not on a daily screen.
+
+`DamageAssessment` in `src/vision.ts` is the single definition of what an
+assessment is. ModelArk receives it as a strict JSON schema, Anthropic as a
+structured-output format, and **both replies are validated against it** before
+any number reaches scoring. A provider that answers off-schema raises an error;
+it is never coerced into a usable-looking assessment.
+
+**Photos are inlined, not linked.** ModelArk will fetch an image URL from its
+own egress, but Al Qaryah's images sit behind the same Cloudflare tenancy that
+already refuses this container's plain `fetch` — a stranger's datacenter IP will
+score no better than ours. So the bytes are pulled here, through the browser
+context that already holds the clearance cookie, and sent as base64. That is
+also why the browser stays open through the vision stage rather than closing
+after the render. When some photos fail to load, the prompt says how many are
+missing so the model lowers its own confidence rather than assessing a thin set
+as though it were complete.
+
+---
+
 ## The digest
 
 Single HTML email, sorted by **auction close time ascending, never by margin** —
@@ -162,12 +190,13 @@ Ordered, from §11:
    older than 90 days raise a staleness warning in the digest footer.
 3. ~~Field normalisation at the fetch boundary~~ — `src/normalise.ts`
 4. ~~VIN relisting dedup~~ — `src/db.ts`
-5. **Socket frame parser** in `watcher.ts` — `parseSocketFrame()` is a stub and
-   deliberately not guessed. Run one authenticated capture during a live auction
-   with `DUMP_FRAMES=1`, which writes every websocket frame to
-   `logs/socket-frames.jsonl`; identify the message carrying the running bid and
-   lot identifier, then implement the parse. Until then the poll fallback runs
-   and every unobserved lot is gap-flagged.
+5. **Socket frame schema** — `src/auctionroom.ts` joins
+   `/auction-join?id=…&lane=…` with the saved bidder session and reads prices off
+   the room's websocket, but the frame shape is inferred by key name rather than
+   known. A price is only recorded when the frame names it as a bid or a sale;
+   anything else is gap-flagged carrying the candidate. Run one authenticated
+   capture during a live auction with `DUMP_FRAMES=1`, which writes every frame
+   to `logs/socket-frames.jsonl`, then replace the heuristic with an exact parse.
 6. **Wire to the ARKS UAE market comps step** once (2) is proven in production.
 
 ---
