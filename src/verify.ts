@@ -12,7 +12,9 @@ import { auctionRoomUrl, decodeFrame, extractObservations } from './auctionroom.
 import {
   ANTHROPIC_VISION_MODEL,
   ARK_VISION_MODEL,
+  BROWSER_HEADERS,
   BROWSER_LAUNCH_ARGS,
+  CONTEXT_EXTRA_HEADERS,
   CONFIG_VERSION,
   MAX_RENDERS_PER_RUN,
   MIN_MODEL_YEAR,
@@ -498,6 +500,25 @@ check('§2.1 a Cloudflare challenge is not read as an empty auction', async () =
     real,
     'and a genuine document still comes through',
   );
+});
+
+check('§2.1 a browser context never overrides per-request headers', () => {
+  // Playwright applies extraHTTPHeaders to EVERY request, so a navigation
+  // header set here stamps "I am a page load" onto every script and XHR the
+  // SPA makes. Cloudflare drops those, the bundles never load, and the detail
+  // page yields no payload — a failure that appears only at the edge, which is
+  // why it is pinned here rather than left to be rediscovered.
+  for (const forbidden of ['Accept', 'Accept-Encoding', 'Upgrade-Insecure-Requests', 'Sec-Fetch-User']) {
+    assert.ok(!(forbidden in CONTEXT_EXTRA_HEADERS), `${forbidden} is Chromium's to set`);
+  }
+  assert.ok(
+    !Object.keys(CONTEXT_EXTRA_HEADERS).some((k) => /^sec-fetch-/i.test(k)),
+    'the whole Sec-Fetch-* family is per-request',
+  );
+  assert.ok(!('User-Agent' in CONTEXT_EXTRA_HEADERS), 'User-Agent is a context option, so navigator agrees with the wire');
+  assert.ok(Object.keys(CONTEXT_EXTRA_HEADERS).length > 0, 'but the client hints are still worth sending');
+  // The plain-fetch set is a different job and must keep them.
+  assert.equal(BROWSER_HEADERS['Sec-Fetch-Mode'], 'navigate');
 });
 
 check('§2.1 Chromium is launched with the flags a root container requires', () => {

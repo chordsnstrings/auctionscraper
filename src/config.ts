@@ -56,7 +56,19 @@ export const BROWSER_LAUNCH_ARGS: readonly string[] = [
   '--disable-gpu',
 ];
 
-/** Cloudflare rejects default UAs with 403; a complete header set gets 200 (§2.1). */
+/**
+ * Headers for plain `fetch`, which sends almost nothing by default.
+ *
+ * These are NOT for a Playwright context. They describe a top-level
+ * navigation — `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`,
+ * `Accept: text/html`, `Upgrade-Insecure-Requests` — and Playwright's
+ * `extraHTTPHeaders` applies whatever it is given to *every* request, so
+ * setting them on a context stamps "I am a page navigation" onto every script,
+ * stylesheet and XHR the page makes. No real browser does that, and Cloudflare
+ * drops those subresource requests: the detail page then loads its document,
+ * fetches nothing else at all, and the SPA never calls the API. Use
+ * CONTEXT_EXTRA_HEADERS for a browser.
+ */
 export const BROWSER_HEADERS: Record<string, string> = {
   'User-Agent':
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -72,6 +84,24 @@ export const BROWSER_HEADERS: Record<string, string> = {
   'Sec-Fetch-User': '?1',
   'Upgrade-Insecure-Requests': '1',
 };
+
+/**
+ * What a Playwright context may add on top of what Chromium already sends.
+ *
+ * Only headers that are the same on every request regardless of what is being
+ * fetched. Everything per-request — `Accept`, `Accept-Encoding`, the whole
+ * `Sec-Fetch-*` family, `Upgrade-Insecure-Requests` — is Chromium's to set, and
+ * it sets them consistently with the rest of its fingerprint. Overriding them
+ * is what made the SPA load its shell and then nothing else.
+ *
+ * `User-Agent` is absent deliberately: it is a context option, not an extra
+ * header, so that navigator.userAgent agrees with the wire.
+ */
+export const CONTEXT_EXTRA_HEADERS: Record<string, string> = Object.fromEntries(
+  Object.entries(BROWSER_HEADERS).filter(([k]) =>
+    /^(?:Accept-Language|Sec-Ch-Ua|Sec-Ch-Ua-Mobile|Sec-Ch-Ua-Platform)$/i.test(k),
+  ),
+);
 
 // ── Pre-gate (§6.2) — free, runs on URL fields before any browser work ──────
 

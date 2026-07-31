@@ -15,6 +15,7 @@ import {
   API_RESPONSE_PATTERN,
   BROWSER_HEADERS,
   BROWSER_LAUNCH_ARGS,
+  CONTEXT_EXTRA_HEADERS,
   CONCURRENCY,
   DELAY_MS,
   IGNORE_HTTPS_ERRORS,
@@ -53,9 +54,7 @@ export class Fetcher {
       locale: 'en-GB',
       timezoneId: 'Asia/Dubai',
       viewport: { width: 1440, height: 900 },
-      extraHTTPHeaders: Object.fromEntries(
-        Object.entries(BROWSER_HEADERS).filter(([k]) => k !== 'User-Agent'),
-      ),
+      extraHTTPHeaders: CONTEXT_EXTRA_HEADERS,
       ...(useSession && existsSync(SESSION_STATE_PATH) ? { storageState: SESSION_STATE_PATH } : {}),
     });
 
