@@ -19,6 +19,7 @@ import {
   ARK_VISION_MODEL,
   BROWSER_HEADERS,
   DATABASE_URL,
+  MIN_MODEL_YEAR,
   ROOT_SITEMAP,
   SITE_ORIGIN,
   SMTP,
@@ -28,12 +29,17 @@ import {
 } from './config.js';
 import { closeDb, db, migrate } from './db.js';
 import { Fetcher } from './fetcher.js';
+import { preGate } from './gates.js';
 import { walkSitemap } from './sitemap.js';
 import type { LotRef } from './types.js';
 import * as ui from './ui.js';
 
-/** How far into the sitemap preflight walks, and how many lots it renders. */
-const SITEMAP_SAMPLE = 12;
+/**
+ * How far into the sitemap preflight walks, and how many lots it renders.
+ * The sample is wide because it is filtered down to lots the run would actually
+ * render, and the walk stops at the first document that yields this many.
+ */
+const SITEMAP_SAMPLE = 800;
 const DETAIL_ATTEMPTS = 3;
 
 type Status = 'ok' | 'warn' | 'fail';
@@ -144,7 +150,7 @@ async function checkSitemapThroughBrowser(fetcher: Fetcher): Promise<LotRef[]> {
     // Print what was parsed, not just how many. A URL shape that changed shows
     // up here as a nonsense make/model pair long before it shows up as an
     // empty digest.
-    for (const l of lots.slice(0, 3)) ui.note(`      ${l.key} ${l.year} · ${l.id} · ${l.url}`);
+    for (const l of probeCandidates(lots, 3)) ui.note(`      ${l.key} ${l.year} · ${l.id} · ${l.url}`);
     add(
       lots.length > 0
         ? {
@@ -167,12 +173,34 @@ async function checkSitemapThroughBrowser(fetcher: Fetcher): Promise<LotRef[]> {
   }
 }
 
+/**
+ * Which lots to probe with.
+ *
+ * The head of the sitemap is not the front of the auction — in production it is
+ * 1960 Ramblers and a 2012 lot the site files under Alfa Romeo. Those render a
+ * page that never calls the vehicle API, so probing them proves nothing about
+ * whether the pipeline works. Prefer exactly what the run would render, then
+ * anything recent enough to still be listed, and only then the head.
+ */
+export function probeCandidates(lots: readonly LotRef[], want: number): LotRef[] {
+  const recent = (l: LotRef): boolean => Number.isFinite(l.year) && l.year >= MIN_MODEL_YEAR;
+  const seen = new Set<string>();
+  const out: LotRef[] = [];
+  for (const l of [...lots.filter(preGate), ...lots.filter(recent), ...lots]) {
+    if (seen.has(l.id)) continue;
+    seen.add(l.id);
+    out.push(l);
+    if (out.length >= want) break;
+  }
+  return out;
+}
+
 /** Render detail pages and pull one photo's bytes — the vision stage's input. */
 async function checkRenderAndPhoto(fetcher: Fetcher, refs: readonly LotRef[]): Promise<void> {
   let vehicle: Awaited<ReturnType<Fetcher['fetchLot']>> = null;
   let tried = 0;
 
-  for (const ref of refs.slice(0, DETAIL_ATTEMPTS)) {
+  for (const ref of probeCandidates(refs, DETAIL_ATTEMPTS)) {
     tried += 1;
     try {
       vehicle = await fetcher.fetchLot(ref);
