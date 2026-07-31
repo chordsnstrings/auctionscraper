@@ -130,8 +130,8 @@ export async function migrate(): Promise<void> {
   // a transaction-pooling proxy cannot discard, unlike a per-session SET or a
   // startup option.
   await q(`ALTER ROLE CURRENT_USER SET search_path TO ${schema()}, public`).catch(() => undefined);
-  await q(String.raw`
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.vehicle (
+  await q(`
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.vehicle (
       id                TEXT PRIMARY KEY,
       vin               TEXT,
       lot_no            BIGINT,
@@ -158,13 +158,13 @@ export async function migrate(): Promise<void> {
 
     -- VIN dedup for relistings (§5). Partial: many rows legitimately have no
     -- VIN, and those must not collide with one another.
-    CREATE UNIQUE INDEX IF NOT EXISTS vehicle_vin_uniq ON ${SCHEMA}.vehicle (vin) WHERE vin IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS vehicle_open ON ${SCHEMA}.vehicle (delisted_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS vehicle_vin_uniq ON __SCHEMA__.vehicle (vin) WHERE vin IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS vehicle_open ON __SCHEMA__.vehicle (delisted_at);
 
     -- Immutable. One row per evaluation; re-runs append. Never updated.
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.assessment (
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.assessment (
       id                BIGGENERATED,
-      vehicle_id        TEXT NOT NULL REFERENCES ${SCHEMA}.vehicle(id),
+      vehicle_id        TEXT NOT NULL REFERENCES __SCHEMA__.vehicle(id),
       assessed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
       config_version    TEXT NOT NULL,
       gate              TEXT NOT NULL,
@@ -178,20 +178,20 @@ export async function migrate(): Promise<void> {
       margin_aed        BIGINT,
       reasons           JSONB
     );
-    CREATE INDEX IF NOT EXISTS assessment_vehicle ON ${SCHEMA}.assessment (vehicle_id, assessed_at);
+    CREATE INDEX IF NOT EXISTS assessment_vehicle ON __SCHEMA__.assessment (vehicle_id, assessed_at);
 
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.price_history (
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.price_history (
       id            BIGGENERATED,
-      vehicle_id    TEXT NOT NULL REFERENCES ${SCHEMA}.vehicle(id),
+      vehicle_id    TEXT NOT NULL REFERENCES __SCHEMA__.vehicle(id),
       observed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
       starting_bid  BIGINT,
       status        TEXT,
       auction_id    TEXT
     );
-    CREATE INDEX IF NOT EXISTS price_history_vehicle ON ${SCHEMA}.price_history (vehicle_id);
+    CREATE INDEX IF NOT EXISTS price_history_vehicle ON __SCHEMA__.price_history (vehicle_id);
 
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.watchlist (
-      vehicle_id   TEXT PRIMARY KEY REFERENCES ${SCHEMA}.vehicle(id),
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.watchlist (
+      vehicle_id   TEXT PRIMARY KEY REFERENCES __SCHEMA__.vehicle(id),
       auction_id   TEXT,
       lot_no       BIGINT,
       lane         TEXT,
@@ -201,12 +201,12 @@ export async function migrate(): Promise<void> {
       resolved_at  TIMESTAMPTZ,
       outcome      TEXT
     );
-    CREATE INDEX IF NOT EXISTS watchlist_open ON ${SCHEMA}.watchlist (auction_id, resolved_at);
+    CREATE INDEX IF NOT EXISTS watchlist_open ON __SCHEMA__.watchlist (auction_id, resolved_at);
 
     -- amount IS NULL ⇒ gap_reason populated. A lot is never omitted (§8.4).
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.bid_observation (
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.bid_observation (
       id           BIGGENERATED,
-      vehicle_id   TEXT NOT NULL REFERENCES ${SCHEMA}.vehicle(id),
+      vehicle_id   TEXT NOT NULL REFERENCES __SCHEMA__.vehicle(id),
       auction_id   TEXT,
       lane         TEXT,
       observed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -215,22 +215,22 @@ export async function migrate(): Promise<void> {
       gap_reason   TEXT,
       CONSTRAINT amount_or_gap CHECK (amount IS NOT NULL OR gap_reason IS NOT NULL)
     );
-    CREATE INDEX IF NOT EXISTS bid_observation_auction ON ${SCHEMA}.bid_observation (auction_id);
+    CREATE INDEX IF NOT EXISTS bid_observation_auction ON __SCHEMA__.bid_observation (auction_id);
 
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.sitemap_snapshot (
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.sitemap_snapshot (
       lot_id   TEXT PRIMARY KEY,
       url      TEXT NOT NULL,
       seen_on  DATE NOT NULL
     );
 
     -- Prevents re-reporting a lot as NEW on a same-day re-run (§12).
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.digest_log (
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.digest_log (
       vehicle_id     TEXT PRIMARY KEY,
       first_sent_on  DATE NOT NULL,
       last_sent_on   DATE NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS ${SCHEMA}.run_log (
+    CREATE TABLE IF NOT EXISTS __SCHEMA__.run_log (
       id           BIGGENERATED,
       started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
       finished_at  TIMESTAMPTZ,
@@ -238,7 +238,7 @@ export async function migrate(): Promise<void> {
       stats_json   JSONB
     );
   `.replace(/BIGGENERATED/g, 'BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY')
-     .replace(/\$\{SCHEMA\}/g, schema()));
+     .replace(/__SCHEMA__/g, schema()));
 
   // The DDL above is schema-qualified, so it always lands correctly. The
   // runtime queries are not, so prove resolution works on a *fresh* connection
