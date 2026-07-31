@@ -32,6 +32,10 @@ import { walkSitemap } from './sitemap.js';
 import type { LotRef } from './types.js';
 import * as ui from './ui.js';
 
+/** How far into the sitemap preflight walks, and how many lots it renders. */
+const SITEMAP_SAMPLE = 12;
+const DETAIL_ATTEMPTS = 3;
+
 type Status = 'ok' | 'warn' | 'fail';
 
 interface Check {
@@ -117,11 +121,12 @@ async function checkBrowser(): Promise<void> {
     // <loc> elements, so the run reports an empty auction instead of a block.
     const lots = await checkSitemapThroughBrowser(fetcher);
 
-    // One real lot, all the way to its photo bytes. This is the only check that
-    // proves the paid stage has anything to look at: the vision provider is
-    // shown inlined bytes, so an image host that refuses us costs every
-    // assessment in the run.
-    if (lots[0]) await checkRenderAndPhoto(fetcher, lots[0]);
+    // Real lots, all the way to photo bytes. This is the only check that proves
+    // the paid stage has anything to look at: the vision provider is shown
+    // inlined bytes, so an image host that refuses us costs every assessment in
+    // the run. Several lots are tried because the head of the sitemap is
+    // whatever the site lists first, which is often long delisted.
+    if (lots.length > 0) await checkRenderAndPhoto(fetcher, lots);
   } catch (err) {
     add({ name: 'browser → site', status: 'fail', detail: (err as Error).message.slice(0, 60), gating: true });
   } finally {
@@ -135,7 +140,11 @@ async function checkBrowser(): Promise<void> {
  */
 async function checkSitemapThroughBrowser(fetcher: Fetcher): Promise<LotRef[]> {
   try {
-    const lots = await walkSitemap({ limit: 5, readXml: fetcher.xmlReader() });
+    const lots = await walkSitemap({ limit: SITEMAP_SAMPLE, readXml: fetcher.xmlReader() });
+    // Print what was parsed, not just how many. A URL shape that changed shows
+    // up here as a nonsense make/model pair long before it shows up as an
+    // empty digest.
+    for (const l of lots.slice(0, 3)) ui.note(`      ${l.key} ${l.year} · ${l.id} · ${l.url}`);
     add(
       lots.length > 0
         ? {
@@ -158,18 +167,30 @@ async function checkSitemapThroughBrowser(fetcher: Fetcher): Promise<LotRef[]> {
   }
 }
 
-/** Render one detail page and pull one photo's bytes — the vision stage's input. */
-async function checkRenderAndPhoto(fetcher: Fetcher, ref: LotRef): Promise<void> {
-  let vehicle: Awaited<ReturnType<Fetcher['fetchLot']>>;
-  try {
-    vehicle = await fetcher.fetchLot(ref);
-  } catch (err) {
-    add({ name: 'browser → detail page', status: 'fail', detail: (err as Error).message.slice(0, 60), gating: true });
-    return;
+/** Render detail pages and pull one photo's bytes — the vision stage's input. */
+async function checkRenderAndPhoto(fetcher: Fetcher, refs: readonly LotRef[]): Promise<void> {
+  let vehicle: Awaited<ReturnType<Fetcher['fetchLot']>> = null;
+  let tried = 0;
+
+  for (const ref of refs.slice(0, DETAIL_ATTEMPTS)) {
+    tried += 1;
+    try {
+      vehicle = await fetcher.fetchLot(ref);
+    } catch (err) {
+      ui.note(`      ${ref.id} threw: ${(err as Error).message.slice(0, 70)}`);
+      continue;
+    }
+    if (vehicle) break;
+    ui.note(`      ${ref.id} rendered but produced no payload — ${ref.url}`);
   }
 
   if (!vehicle) {
-    add({ name: 'browser → detail page', status: 'fail', detail: 'no vehicle payload intercepted', gating: true });
+    add({
+      name: 'browser → detail page',
+      status: 'fail',
+      detail: `no vehicle payload from ${tried} lot(s) — check the URL shape above`,
+      gating: true,
+    });
     return;
   }
   add({
