@@ -78,18 +78,59 @@ export const today = (): string => new Date().toISOString().slice(0, 10);
 
 // ── schema ─────────────────────────────────────────────────────────────────
 
+/**
+ * Where the tables actually live. Resolved once, at migrate time: a managed
+ * database may or may not let the application role create a schema, and the
+ * answer decides how every later query must be written.
+ */
+let resolvedSchema: string | null = null;
+export const schema = (): string => resolvedSchema ?? SCHEMA;
+
+/** Identity and grants, for when a permission error needs explaining. */
+export async function describeAccess(): Promise<string> {
+  try {
+    const [r] = await q<Record<string, unknown>>(`
+      SELECT current_user AS usr, current_database() AS db, version() AS ver,
+             has_database_privilege(current_database(), 'CREATE') AS can_create_db,
+             has_schema_privilege('public', 'CREATE') AS can_create_public,
+             pg_get_userbyid(d.datdba) AS db_owner
+      FROM pg_database d WHERE d.datname = current_database()`);
+    return r
+      ? `user=${String(r.usr)} db=${String(r.db)} db_owner=${String(r.db_owner)} ` +
+        `create_on_db=${String(r.can_create_db)} create_on_public=${String(r.can_create_public)}`
+      : 'no access info';
+  } catch (err) {
+    return `access probe failed: ${(err as Error).message}`;
+  }
+}
+
 export async function migrate(): Promise<void> {
   // Owned by the connecting role, so it has CREATE here even though Postgres 15
   // denies it on `public`. Explicitly named, so it does not depend on
   // search_path pointing anywhere useful yet.
-  await q(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA} AUTHORIZATION CURRENT_USER`);
+  // Preferred: an application-owned schema, because Postgres 15 revoked CREATE
+  // on `public` from non-owners. Not every managed role may create one, so the
+  // fallback is `public` — and if neither works, say exactly why rather than
+  // surfacing a bare "permission denied".
+  try {
+    await q(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA} AUTHORIZATION CURRENT_USER`);
+    resolvedSchema = SCHEMA;
+  } catch (err) {
+    const access = await describeAccess();
+    if (!(await q<{ ok: boolean }>(`SELECT has_schema_privilege('public','CREATE') AS ok`))[0]?.ok) {
+      throw new Error(
+        `cannot create schema "${SCHEMA}" (${(err as Error).message}) and cannot create in "public". ${access}`,
+      );
+    }
+    console.warn(`[db] schema creation denied, falling back to public — ${access}`);
+    resolvedSchema = 'public';
+  }
 
-  // Belt and braces for the runtime queries, which use unqualified names.
-  // Startup `options` and per-session `SET` are both discarded by a
-  // transaction-pooling proxy; a role-level default survives it because the
-  // server applies it when each backend session starts.
-  await q(`ALTER ROLE CURRENT_USER SET search_path TO ${SCHEMA}, public`).catch(() => undefined);
-  await q(`
+  // Runtime queries use unqualified names. A role-level default is the one form
+  // a transaction-pooling proxy cannot discard, unlike a per-session SET or a
+  // startup option.
+  await q(`ALTER ROLE CURRENT_USER SET search_path TO ${schema()}, public`).catch(() => undefined);
+  await q(String.raw`
     CREATE TABLE IF NOT EXISTS ${SCHEMA}.vehicle (
       id                TEXT PRIMARY KEY,
       vin               TEXT,
@@ -196,7 +237,8 @@ export async function migrate(): Promise<void> {
       kind         TEXT NOT NULL,
       stats_json   JSONB
     );
-  `.replace(/BIGGENERATED/g, 'BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY'));
+  `.replace(/BIGGENERATED/g, 'BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY')
+     .replace(/\$\{SCHEMA\}/g, schema()));
 
   // The DDL above is schema-qualified, so it always lands correctly. The
   // runtime queries are not, so prove resolution works on a *fresh* connection
@@ -205,7 +247,7 @@ export async function migrate(): Promise<void> {
   const [check] = await q<{ resolved: string | null }>(`SELECT to_regclass('vehicle')::text AS resolved`);
   if (!check?.resolved) {
     throw new Error(
-      `search_path does not resolve unqualified names to ${SCHEMA}. ` +
+      `search_path does not resolve unqualified names to ${schema()}. ` +
         `Set it on the database role, or qualify the runtime queries.`,
     );
   }

@@ -17,7 +17,7 @@
  */
 import { spawn } from 'node:child_process';
 import { DIGEST_TIMEZONE } from './config.js';
-import { closeDb, migrate } from './db.js';
+import { closeDb, describeAccess, migrate, schema } from './db.js';
 
 const RUN_HOUR = Number(process.env.RUN_HOUR ?? 6);
 
@@ -63,16 +63,24 @@ function runScript(script: string, timeoutMs: number): Promise<number> {
 async function main(): Promise<void> {
   log(`worker starting · timezone=${DIGEST_TIMEZONE} · daily run at ${RUN_HOUR}:00`);
 
-  try {
-    await migrate();
-    log('database migrated');
-  } catch (err) {
-    log(`FATAL: database unreachable — ${(err as Error).message}`);
-    process.exitCode = 1;
-    return;
-  } finally {
-    await closeDb();
+  // A database problem must not crash-loop the worker: App Platform then
+  // restarts it faster than logs can be read, and every later deployment
+  // queues behind the flapping container. Report, keep the process alive, and
+  // retry — the daily run checks again anyway.
+  let dbReady = false;
+  for (let attempt = 1; attempt <= 3 && !dbReady; attempt += 1) {
+    try {
+      await migrate();
+      log(`database ready · schema=${schema()}`);
+      dbReady = true;
+    } catch (err) {
+      log(`database not ready (attempt ${attempt}/3): ${(err as Error).message}`);
+      log(`access: ${await describeAccess().catch(() => 'unavailable')}`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 10_000));
+    }
   }
+  await closeDb();
+  if (!dbReady) log('CONTINUING WITHOUT A DATABASE — runs will fail until this is fixed.');
 
   const pre = await runScript('preflight', 10 * 60_000);
   if (pre !== 0) {
