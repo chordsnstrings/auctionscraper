@@ -34,6 +34,7 @@ import { preGate } from './gates.js';
 import { walkSitemap } from './sitemap.js';
 import type { LotRef } from './types.js';
 import * as ui from './ui.js';
+import { assess } from './vision.js';
 
 /**
  * How far into the sitemap preflight walks, and how many lots it renders.
@@ -288,6 +289,37 @@ async function checkRenderAndPhoto(fetcher: Fetcher, refs: readonly LotRef[]): P
           gating: false,
         },
   );
+  if (!photo) return;
+
+  // One real assessment of one real lot. Every other check on the paid stage
+  // proves a precondition; this is the only one that proves the thing itself —
+  // key, entitlement, photo bytes, schema conformance and a usable tier, all at
+  // once. It costs a few thousand tokens per boot, which is the cheapest
+  // insurance in the pipeline.
+  try {
+    const t0 = Date.now();
+    const result = await assess(vehicle, fetcher.photoLoader());
+    add(
+      result
+        ? {
+            name: 'vision → assessment',
+            status: 'ok',
+            detail:
+              `tier ${result.tier} · repair ${result.repairLowAed}–${result.repairHighAed} AED · ` +
+              `confidence ${result.confidence.toFixed(2)} · ${result.photosUsed} photo(s) · ` +
+              `${((Date.now() - t0) / 1000).toFixed(1)}s`,
+            gating: false,
+          }
+        : { name: 'vision → assessment', status: 'warn', detail: 'lot had no photos to assess', gating: false },
+    );
+  } catch (err) {
+    add({
+      name: 'vision → assessment',
+      status: 'fail',
+      detail: (err as Error).message.slice(0, 80),
+      gating: false,
+    });
+  }
 }
 
 async function checkDatabase(): Promise<void> {
