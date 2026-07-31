@@ -75,13 +75,26 @@ ever reject, never promote.
 **Silence is never a pass.** An absent `clean_title` surfaces the lot as
 `UNVERIFIED` for physical inspection. It is not quietly treated as clean.
 
-**Every request to Al Qaryah goes through the browser.** Plain `fetch` from a
-datacenter IP is served a Cloudflare challenge, and a challenge is a 200 with no
-`<loc>` in it — so a naive sitemap read turns a block into "nothing listed
-today". Sitemap XML, detail pages and lot photos all go through one Chromium
-context, which is why the browser opens before the sitemap walk and closes after
-the vision stage. `npm run preflight` walks that whole path for real, ending at
-one lot's photo bytes, and its sitemap check is gating.
+**Every request to Al Qaryah goes through the browser, and through a real
+navigation.** Plain `fetch` from a datacenter IP is served a Cloudflare
+challenge, and a challenge is a 200 with no `<loc>` in it — so a naive sitemap
+read turns a block into "nothing listed today". `context.request` is no better:
+it shares the cookie jar but is Playwright's Node HTTP stack underneath, so it
+gets challenged too. `Fetcher.readBytes()` navigates and returns
+`response.body()`; sitemap XML, lot photos, active auctions and the server clock
+all use it.
+
+**A browser context must not be given `BROWSER_HEADERS`.** That set describes a
+top-level navigation, and `extraHTTPHeaders` applies whatever it is given to
+*every* request — so it stamps `Sec-Fetch-Mode: navigate` and `Accept: text/html`
+onto every script and XHR the SPA makes. Cloudflare drops those: the page loads
+its document, fetches nothing else at all, and the API is never called. Contexts
+get `CONTEXT_EXTRA_HEADERS` — only what is constant per request. There is a
+check pinning this, because it fails at the edge and nowhere else.
+
+`npm run preflight` walks the whole path for real — site, sitemap, a rendered
+detail page, that lot's photo bytes, and one actual ModelArk assessment of it.
+The sitemap and detail-page checks are gating.
 
 **Unobserved data is a gap, not an omission.** A watchlist lot the watcher fails
 to price is written to `bid_observation` with `amount = NULL` and a populated
