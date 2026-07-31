@@ -14,6 +14,7 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import {
   API_ORIGIN,
+  API_RESPONSE_PATTERN,
   ARK_API_KEY,
   ARK_BASE_URL,
   ARK_VISION_MODEL,
@@ -216,9 +217,23 @@ async function checkRenderAndPhoto(fetcher: Fetcher, refs: readonly LotRef[]): P
     add({
       name: 'browser → detail page',
       status: 'fail',
-      detail: `no vehicle payload from ${tried} lot(s) — check the URL shape above`,
+      detail: `no vehicle payload from ${tried} lot(s)`,
       gating: true,
     });
+
+    // Say which kind of failure it was rather than leaving it to be guessed.
+    const probe = probeCandidates(refs, 1)[0];
+    if (probe) {
+      const d = await fetcher.diagnoseLot(probe);
+      ui.note(`      page ${d.status} "${d.title}" → ${d.finalUrl.slice(0, 100)}`);
+      if (d.responses.length === 0) {
+        ui.note('      the page made no requests to alqaryahauction.com at all');
+      }
+      for (const r of d.responses.slice(0, 12)) {
+        ui.note(`      ${String(r.status).padEnd(4)} ${r.hasId ? 'HAS-ID' : '      '} ${r.bytes}B ${r.url}`);
+      }
+      ui.note(`      API_RESPONSE_PATTERN = ${API_RESPONSE_PATTERN}`);
+    }
     return;
   }
   add({

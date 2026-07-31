@@ -205,6 +205,64 @@ export class Fetcher {
   }
 
   /**
+   * Render one detail page and report what it actually did.
+   *
+   * Used only by preflight, and only when `fetchLot` came back empty. "No
+   * payload" has several very different causes — the page 404s, Cloudflare
+   * challenges the XHR, the API host moved, the id in the body is cased
+   * differently — and they are indistinguishable from the outside. This records
+   * every response the page made so the log says which one it was.
+   */
+  async diagnoseLot(ref: LotRef): Promise<{
+    status: number;
+    finalUrl: string;
+    title: string;
+    responses: { url: string; status: number; hasId: boolean; bytes: number }[];
+  }> {
+    const page = await this.ctx().newPage();
+    const responses: { url: string; status: number; hasId: boolean; bytes: number }[] = [];
+
+    const onResponse = async (res: {
+      url(): string;
+      status(): number;
+      text(): Promise<string>;
+    }): Promise<void> => {
+      const url = res.url();
+      if (!/alqaryahauction\.com/i.test(url)) return;
+      if (/\.(?:js|css|woff2?|png|jpe?g|svg|webp|ico)(?:\?|$)/i.test(url)) return;
+      let body = '';
+      try {
+        body = await res.text();
+      } catch {
+        /* body already consumed or a redirect */
+      }
+      responses.push({
+        url: url.slice(0, 120),
+        status: res.status(),
+        hasId: body.toLowerCase().includes(ref.id.toLowerCase()),
+        bytes: body.length,
+      });
+    };
+
+    page.on('response', onResponse);
+    try {
+      const nav = await page.goto(ref.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => undefined);
+      return {
+        status: nav?.status() ?? 0,
+        finalUrl: page.url(),
+        title: (await page.title().catch(() => '')).slice(0, 80),
+        responses,
+      };
+    } catch (err) {
+      return { status: -1, finalUrl: (err as Error).message.slice(0, 80), title: '', responses };
+    } finally {
+      page.off('response', onResponse);
+      await page.close().catch(() => undefined);
+    }
+  }
+
+  /**
    * Render a batch with CONCURRENCY workers and DELAY_MS between navigations.
    * `onLot` is invoked as each result lands so the caller can stream progress.
    */
