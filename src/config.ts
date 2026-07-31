@@ -40,6 +40,22 @@ export const API_CAPTURE_TIMEOUT_MS = 20_000;
 /** Behind a TLS-intercepting proxy Playwright contexts need this (§2.1). */
 export const IGNORE_HTTPS_ERRORS = true;
 
+/**
+ * Chromium launch arguments, in one place because getting them wrong fails at
+ * the container and nowhere else.
+ *
+ * `--no-sandbox` is not optional here: the image runs as root, and Chromium
+ * refuses to start as root with the sandbox on. `--disable-dev-shm-usage`
+ * matters for the same reason — the default /dev/shm in a container is 64 MB,
+ * which Chromium exhausts and then crashes mid-render.
+ */
+export const BROWSER_LAUNCH_ARGS: readonly string[] = [
+  '--disable-blink-features=AutomationControlled',
+  '--no-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+];
+
 /** Cloudflare rejects default UAs with 403; a complete header set gets 200 (§2.1). */
 export const BROWSER_HEADERS: Record<string, string> = {
   'User-Agent':

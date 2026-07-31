@@ -14,6 +14,7 @@
  */
 import { existsSync } from 'node:fs';
 import { chromium, type Browser } from 'playwright';
+import { BROWSER_LAUNCH_ARGS } from './config.js';
 import * as ui from './ui.js';
 
 /** iPhone SE through to the design width. */
@@ -24,10 +25,11 @@ const PAGES = ['preview/sample.html', 'preview/empty.html'];
  * Honour a pre-provisioned browser when one is present, so CI images that ship
  * Chromium do not have to re-download it.
  */
-function launchOptions(): { executablePath?: string } {
+function launchOptions(): { executablePath?: string; args: string[] } {
   const pinned = process.env.CHROMIUM_PATH;
-  if (pinned && existsSync(pinned)) return { executablePath: pinned };
-  return {};
+  const args = [...BROWSER_LAUNCH_ARGS];
+  if (pinned && existsSync(pinned)) return { executablePath: pinned, args };
+  return { args };
 }
 
 interface Offender {

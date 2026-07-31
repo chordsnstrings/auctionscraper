@@ -59,20 +59,37 @@ function extractLocs(xml: string): string[] {
   return out;
 }
 
-async function fetchXml(url: string): Promise<string | null> {
+/**
+ * Fetches one XML document. Injectable because plain `fetch` is not enough:
+ * Cloudflare scores this container's IP badly enough to serve a challenge, and
+ * a challenge parses as "no <loc> elements" — a silently empty crawl rather
+ * than an error. The run passes a browser-backed reader, which presents the
+ * TLS and HTTP/2 fingerprint the site actually accepts.
+ */
+export type XmlReader = (url: string) => Promise<string | null>;
+
+/** Cloudflare's interstitial, which is valid HTTP and useless XML. */
+function isChallenge(body: string): boolean {
+  return /Attention Required|cf-browser-verification|Cloudflare Ray ID|__cf_chl/i.test(body);
+}
+
+export const httpXmlReader: XmlReader = async (url) => {
   try {
     const res = await fetch(url, { headers: { ...BROWSER_HEADERS, Accept: 'application/xml,text/xml,*/*' } });
     if (!res.ok) return null;
-    return await res.text();
+    const body = await res.text();
+    return isChallenge(body) ? null : body;
   } catch {
     return null;
   }
-}
+};
 
 export interface WalkOptions {
   onProgress?: (seen: number, note: string) => void;
   /** Stop after this many detail URLs. Calibration convenience only. */
   limit?: number;
+  /** How to read XML. Defaults to plain HTTP; the run supplies the browser. */
+  readXml?: XmlReader;
 }
 
 /**
@@ -80,6 +97,7 @@ export interface WalkOptions {
  * detail URLs. Rate-limited between XML fetches.
  */
 export async function walkSitemap(opts: WalkOptions = {}): Promise<LotRef[]> {
+  const fetchXml = opts.readXml ?? httpXmlReader;
   const queue: string[] = [VEHICLE_SITEMAP];
   const visited = new Set<string>();
   const lots = new Map<string, LotRef>();

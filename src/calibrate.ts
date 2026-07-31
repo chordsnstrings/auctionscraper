@@ -38,9 +38,23 @@ async function calibrate(): Promise<void> {
   const runId = await startRun('calibrate');
   ui.banner('Calibration crawl', 'gates on · vision off · no email');
 
+  // Same browser for the whole crawl: the sitemap is behind the same Cloudflare
+  // tenancy as the detail pages, and plain `fetch` is served a challenge that
+  // parses as an empty sitemap rather than as an error (§2.1).
+  const fetcher = new Fetcher();
+  await fetcher.open();
+
   const walk = new ui.Progress('sitemap');
-  const diff = await diffSitemap({ onProgress: (seen) => walk.update(seen, seen, 'lots indexed') });
+  const diff = await diffSitemap({
+    onProgress: (seen) => walk.update(seen, seen, 'lots indexed'),
+    readXml: fetcher.xmlReader(),
+  });
   walk.done(`${diff.all.length} lots indexed`);
+
+  if (diff.all.length === 0) {
+    ui.warn('The sitemap walk returned nothing. Calibration cannot conclude anything from that —');
+    ui.note('run `npm run preflight` and read the browser → sitemap check first.');
+  }
 
   const afterYear = diff.all.filter((l) => Number.isFinite(l.year) && l.year >= MIN_MODEL_YEAR);
   const afterModel = diff.all.filter(preGate);
@@ -57,8 +71,6 @@ async function calibrate(): Promise<void> {
   const toRender = sample(afterModel, renderBudget);
   ui.step('Sampling', `${toRender.length} of ${afterModel.length} survivors for title inspection`);
 
-  const fetcher = new Fetcher();
-  await fetcher.open();
   const bar = new ui.Progress('render');
   const vehicles = await fetcher.fetchMany(toRender, (_v, _r, done) =>
     bar.update(done, toRender.length, 'detail pages'),

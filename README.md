@@ -75,6 +75,14 @@ ever reject, never promote.
 **Silence is never a pass.** An absent `clean_title` surfaces the lot as
 `UNVERIFIED` for physical inspection. It is not quietly treated as clean.
 
+**Every request to Al Qaryah goes through the browser.** Plain `fetch` from a
+datacenter IP is served a Cloudflare challenge, and a challenge is a 200 with no
+`<loc>` in it — so a naive sitemap read turns a block into "nothing listed
+today". Sitemap XML, detail pages and lot photos all go through one Chromium
+context, which is why the browser opens before the sitemap walk and closes after
+the vision stage. `npm run preflight` walks that whole path for real, ending at
+one lot's photo bytes, and its sitemap check is gating.
+
 **Unobserved data is a gap, not an omission.** A watchlist lot the watcher fails
 to price is written to `bid_observation` with `amount = NULL` and a populated
 `gap_reason`. Capture failures cluster during the busy, fast stretches of an

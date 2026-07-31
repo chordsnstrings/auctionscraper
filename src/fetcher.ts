@@ -14,6 +14,7 @@ import {
   API_ORIGIN,
   API_RESPONSE_PATTERN,
   BROWSER_HEADERS,
+  BROWSER_LAUNCH_ARGS,
   CONCURRENCY,
   DELAY_MS,
   IGNORE_HTTPS_ERRORS,
@@ -22,6 +23,7 @@ import {
 } from './config.js';
 import { normalise } from './normalise.js';
 import { browserPhotoLoader, httpPhotoLoader, type PhotoLoader } from './photos.js';
+import { httpXmlReader, type XmlReader } from './sitemap.js';
 import type { AuctionPayload, LotRef, NormalisedVehicle, VehiclePayload } from './types.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -36,7 +38,7 @@ export class Fetcher {
   async open(useSession = false): Promise<void> {
     this.browser = await chromium.launch({
       headless: true,
-      args: ['--disable-blink-features=AutomationControlled'],
+      args: [...BROWSER_LAUNCH_ARGS],
     });
     this.context = await this.browser.newContext({
       ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS,
@@ -71,6 +73,31 @@ export class Fetcher {
   /** The live auction room opens its own pages against this context (§8.3). */
   browserContext(): BrowserContext {
     return this.ctx();
+  }
+
+  /**
+   * An XML reader bound to this context, for the sitemap walk.
+   *
+   * The sitemap is the entry point to everything: if Cloudflare serves it a
+   * challenge, the crawl finds zero lots and the digest is empty for a reason
+   * no one can see. Reading it through the browser context uses the same path
+   * that gets 200s on the detail pages.
+   */
+  xmlReader(): XmlReader {
+    return async (url) => {
+      if (!this.context) return httpXmlReader(url);
+      try {
+        const res = await this.context.request.get(url, {
+          headers: { ...BROWSER_HEADERS, Accept: 'application/xml,text/xml,*/*' },
+          timeout: NAV_TIMEOUT_MS,
+        });
+        if (!res.ok()) return null;
+        const body = await res.text();
+        return /<loc>/i.test(body) ? body : null;
+      } catch {
+        return null;
+      }
+    };
   }
 
   /**

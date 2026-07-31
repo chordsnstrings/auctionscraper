@@ -27,6 +27,9 @@ import {
   VISION_PROVIDER,
 } from './config.js';
 import { closeDb, db, migrate } from './db.js';
+import { Fetcher } from './fetcher.js';
+import { walkSitemap } from './sitemap.js';
+import type { LotRef } from './types.js';
 import * as ui from './ui.js';
 
 type Status = 'ok' | 'warn' | 'fail';
@@ -78,36 +81,23 @@ async function checkHttp(label: string, url: string, gating: boolean): Promise<v
  * pipeline is blocked — this is what the pipeline actually uses.
  */
 async function checkBrowser(): Promise<void> {
-  let chromium: typeof import('playwright').chromium;
+  const fetcher = new Fetcher();
   try {
-    ({ chromium } = await import('playwright'));
-  } catch {
-    add({ name: 'playwright', status: 'fail', detail: 'not installed', gating: true });
-    return;
-  }
-
-  let browser;
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    });
+    await fetcher.open();
   } catch (err) {
-    add({ name: 'chromium launch', status: 'fail', detail: (err as Error).message.slice(0, 60), gating: true });
+    // Almost always the container: Chromium will not start as root with the
+    // sandbox on, and that failure looks nothing like a network problem.
+    add({ name: 'chromium launch', status: 'fail', detail: (err as Error).message.slice(0, 70), gating: true });
     return;
   }
 
   try {
-    const ctx = await browser.newContext({
-      userAgent: BROWSER_HEADERS['User-Agent'],
-      locale: 'en-GB',
-      timezoneId: 'Asia/Dubai',
-      ignoreHTTPSErrors: true,
-    });
+    const ctx = fetcher.browserContext();
     const page = await ctx.newPage();
     const res = await page.goto(SITE_ORIGIN, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     const status = res?.status() ?? 0;
     const body = await page.content().catch(() => '');
+    await page.close().catch(() => undefined);
 
     if (status === 200 && !isCloudflareChallenge(body)) {
       add({ name: 'browser → site', status: 'ok', detail: '200 — Cloudflare passed', gating: true });
@@ -121,11 +111,98 @@ async function checkBrowser(): Promise<void> {
         gating: true,
       });
     }
-    await browser.close();
+
+    // The sitemap is the entry point to every lot the run will ever see, and it
+    // is the check that matters most: a challenge served here parses as zero
+    // <loc> elements, so the run reports an empty auction instead of a block.
+    const lots = await checkSitemapThroughBrowser(fetcher);
+
+    // One real lot, all the way to its photo bytes. This is the only check that
+    // proves the paid stage has anything to look at: the vision provider is
+    // shown inlined bytes, so an image host that refuses us costs every
+    // assessment in the run.
+    if (lots[0]) await checkRenderAndPhoto(fetcher, lots[0]);
   } catch (err) {
     add({ name: 'browser → site', status: 'fail', detail: (err as Error).message.slice(0, 60), gating: true });
-    await browser.close().catch(() => undefined);
+  } finally {
+    await fetcher.close().catch(() => undefined);
   }
+}
+
+/**
+ * Walk far enough into the sitemap to prove lots come back, through the same
+ * reader the run uses. `limit` keeps this to the first XML document.
+ */
+async function checkSitemapThroughBrowser(fetcher: Fetcher): Promise<LotRef[]> {
+  try {
+    const lots = await walkSitemap({ limit: 5, readXml: fetcher.xmlReader() });
+    add(
+      lots.length > 0
+        ? {
+            name: 'browser → sitemap',
+            status: 'ok',
+            detail: `${lots.length}+ lots indexed · e.g. ${lots[0]?.key ?? '?'} ${lots[0]?.year ?? ''}`.trim(),
+            gating: true,
+          }
+        : {
+            name: 'browser → sitemap',
+            status: 'fail',
+            detail: 'no lots — the run would report an empty auction',
+            gating: true,
+          },
+    );
+    return lots;
+  } catch (err) {
+    add({ name: 'browser → sitemap', status: 'fail', detail: (err as Error).message.slice(0, 60), gating: true });
+    return [];
+  }
+}
+
+/** Render one detail page and pull one photo's bytes — the vision stage's input. */
+async function checkRenderAndPhoto(fetcher: Fetcher, ref: LotRef): Promise<void> {
+  let vehicle: Awaited<ReturnType<Fetcher['fetchLot']>>;
+  try {
+    vehicle = await fetcher.fetchLot(ref);
+  } catch (err) {
+    add({ name: 'browser → detail page', status: 'fail', detail: (err as Error).message.slice(0, 60), gating: true });
+    return;
+  }
+
+  if (!vehicle) {
+    add({ name: 'browser → detail page', status: 'fail', detail: 'no vehicle payload intercepted', gating: true });
+    return;
+  }
+  add({
+    name: 'browser → detail page',
+    status: 'ok',
+    detail: `${vehicle.year ?? '?'} ${vehicle.make ?? '?'} ${vehicle.model ?? '?'} · ${vehicle.photos.length} photo(s)`,
+    gating: true,
+  });
+
+  if (!VISION_ENABLED) return;
+
+  const first = vehicle.photos[0];
+  if (!first) {
+    add({ name: 'photo fetch', status: 'warn', detail: 'this lot lists no photos', gating: false });
+    return;
+  }
+
+  const photo = await fetcher.photoLoader()(first);
+  add(
+    photo
+      ? {
+          name: 'photo fetch',
+          status: 'ok',
+          detail: `${photo.mime} · ${Math.round(photo.bytes / 1024)} KB inlined`,
+          gating: false,
+        }
+      : {
+          name: 'photo fetch',
+          status: 'fail',
+          detail: 'photo bytes refused — every assessment would fail',
+          gating: false,
+        },
+  );
 }
 
 async function checkDatabase(): Promise<void> {
@@ -241,7 +318,7 @@ async function main(): Promise<void> {
   if (gatingFailures.length > 0) {
     ui.fail('Preflight failed. An empty result from this host is a block, not a finding.');
     for (const f of gatingFailures) ui.note(`   ${f.name}: ${f.detail}`);
-    if (gatingFailures.some((f) => f.detail.includes('Cloudflare'))) {
+    if (gatingFailures.some((f) => f.name.startsWith('browser') || f.detail.includes('Cloudflare'))) {
       ui.note('');
       ui.warn('Cloudflare is refusing this IP. Options, cheapest first:');
       ui.note('   1. Request sanctioned API access from Al Qaryah (§14) — removes the dependency entirely.');

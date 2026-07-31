@@ -69,11 +69,27 @@ export async function run(): Promise<void> {
   const runId = await startRun('daily');
   ui.banner('Daily purchasing screen', 'Al Qaryah Auction · Sharjah · single source');
 
+  // The browser opens first and stays open for the whole run. Every outbound
+  // request to Al Qaryah goes through it — sitemap XML, detail pages and lot
+  // photos alike — because plain `fetch` from this container is served a
+  // Cloudflare challenge, and a challenge parses as an empty sitemap rather
+  // than as an error (§2.1).
+  const fetcher = new Fetcher();
+  await fetcher.open();
+
   // ── 1. Sitemap diff ──────────────────────────────────────────────────────
   ui.step('Walking sitemap tree', '(never paginated listing pages)');
   const walk = new ui.Progress('sitemap');
-  const diff = await diffSitemap({ onProgress: (seen) => walk.update(seen, seen, 'lots indexed') });
+  const diff = await diffSitemap({
+    onProgress: (seen) => walk.update(seen, seen, 'lots indexed'),
+    readXml: fetcher.xmlReader(),
+  });
   walk.done(`${diff.all.length} lots · ${diff.added.length} new · ${diff.removedIds.length} gone`);
+
+  if (diff.all.length === 0) {
+    ui.warn('The sitemap walk returned nothing. That is a block, not an empty auction —');
+    ui.note('run `npm run preflight` and read the browser → sitemap check before trusting this.');
+  }
 
   // ── 2. Pre-gate (free, pre-render) ──────────────────────────────────────
   const afterYear = diff.all.filter(passesYear);
@@ -84,9 +100,6 @@ export async function run(): Promise<void> {
   ui.note(`${toRender.length} pages queued for render (cap ${MAX_RENDERS_PER_RUN})`);
 
   // ── 3. Fetch ─────────────────────────────────────────────────────────────
-  const fetcher = new Fetcher();
-  await fetcher.open();
-
   let auctionCloses = new Map<string, Date>();
   let auctionTitle: string | null = null;
   try {

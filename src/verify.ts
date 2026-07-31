@@ -12,6 +12,7 @@ import { auctionRoomUrl, decodeFrame, extractObservations } from './auctionroom.
 import {
   ANTHROPIC_VISION_MODEL,
   ARK_VISION_MODEL,
+  BROWSER_LAUNCH_ARGS,
   CONFIG_VERSION,
   MAX_RENDERS_PER_RUN,
   MIN_MODEL_YEAR,
@@ -23,7 +24,7 @@ import { MOTION_CSS, stagger } from './digest/motion.js';
 import { gate, preGate } from './gates.js';
 import { coerceYear, normalise, normaliseDamage, toKm } from './normalise.js';
 import { sniffMime } from './photos.js';
-import { modelKey, parseDetailUrl } from './sitemap.js';
+import { httpXmlReader, modelKey, parseDetailUrl, walkSitemap } from './sitemap.js';
 import { computeMaxBid, fleetReadyValue, score } from './scoring.js';
 import type { DigestLot, DigestModel, GateResult, LotRef, VehiclePayload, VisionResult } from './types.js';
 import * as ui from './ui.js';
@@ -466,6 +467,44 @@ check('§8.3 the room URL is built for the lane', () => {
     auctionRoomUrl('6a673203222e2dd50395dcfd', 'lane-a'),
     'https://alqaryahauction.com/auction-join?id=6a673203222e2dd50395dcfd&lane=lane-a',
   );
+});
+
+// ── the Cloudflare path (§2.1) ─────────────────────────────────────────────
+
+check('§2.1 the sitemap walk reads through the injected reader, not plain fetch', async () => {
+  const asked: string[] = [];
+  const lots = await walkSitemap({
+    readXml: async (url) => {
+      asked.push(url);
+      return url.includes('vehicle') ? `<urlset><url><loc>${REF.url}</loc></url></urlset>` : null;
+    },
+  });
+  assert.ok(asked.length > 0, 'the injected reader must be the only way out');
+  assert.equal(lots.length, 1);
+  assert.equal(lots[0]?.key, 'toyota|camry');
+});
+
+check('§2.1 a Cloudflare challenge is not read as an empty auction', async () => {
+  // The whole trap: a challenge is a 200 with no <loc>, so a naive reader turns
+  // a block into "nothing listed today". The reader must return null instead,
+  // which is what makes the run say "block" rather than "quiet day".
+  const challenge = '<html><title>Attention Required! | Cloudflare</title>Ray ID: 8f2c</html>';
+  const asData = `data:text/html;base64,${Buffer.from(challenge).toString('base64')}`;
+  assert.equal(await httpXmlReader(asData), null, 'a 200 challenge body is not a sitemap');
+
+  const real = '<urlset><url><loc>https://www.alqaryahauction.com/sitemaps/vehicle/1.xml</loc></url></urlset>';
+  assert.equal(
+    await httpXmlReader(`data:application/xml;base64,${Buffer.from(real).toString('base64')}`),
+    real,
+    'and a genuine document still comes through',
+  );
+});
+
+check('§2.1 Chromium is launched with the flags a root container requires', () => {
+  // The image runs as root; without this Chromium refuses to start, and it fails
+  // nowhere but in production.
+  assert.ok(BROWSER_LAUNCH_ARGS.includes('--no-sandbox'));
+  assert.ok(BROWSER_LAUNCH_ARGS.includes('--disable-dev-shm-usage'));
 });
 
 // ── vision provider (§6.5) ─────────────────────────────────────────────────
