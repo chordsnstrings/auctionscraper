@@ -13,6 +13,9 @@
 import { Pool, type PoolClient } from 'pg';
 import { DATABASE_URL, DB_SSL } from './config.js';
 
+/** Application-owned schema. See the search_path note in db(). */
+const SCHEMA = (process.env.DB_SCHEMA ?? 'ecosine').replace(/[^a-z0-9_]/gi, '');
+
 let pool: Pool | null = null;
 
 export function db(): Pool {
@@ -48,6 +51,15 @@ export function db(): Pool {
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 15_000,
   });
+
+  // Postgres 15 revoked CREATE on `public` from everyone but the database
+  // owner, and managed providers hand out a non-owner role. Everything lives in
+  // an application-owned schema instead of fighting that; the search_path is
+  // pinned per connection so unqualified table names keep working.
+  pool.on('connect', (client) => {
+    client.query(`SET search_path TO ${SCHEMA}, public`).catch(() => undefined);
+  });
+
   return pool;
 }
 
@@ -65,6 +77,10 @@ export const today = (): string => new Date().toISOString().slice(0, 10);
 // ── schema ─────────────────────────────────────────────────────────────────
 
 export async function migrate(): Promise<void> {
+  // Owned by the connecting role, so it has CREATE here even though Postgres 15
+  // denies it on `public`.
+  await q(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA} AUTHORIZATION CURRENT_USER`);
+  await q(`SET search_path TO ${SCHEMA}, public`);
   await q(`
     CREATE TABLE IF NOT EXISTS vehicle (
       id                TEXT PRIMARY KEY,
