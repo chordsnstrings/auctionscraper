@@ -83,8 +83,14 @@ export async function migrate(): Promise<void> {
   // denies it on `public`. Explicitly named, so it does not depend on
   // search_path pointing anywhere useful yet.
   await q(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA} AUTHORIZATION CURRENT_USER`);
+
+  // Belt and braces for the runtime queries, which use unqualified names.
+  // Startup `options` and per-session `SET` are both discarded by a
+  // transaction-pooling proxy; a role-level default survives it because the
+  // server applies it when each backend session starts.
+  await q(`ALTER ROLE CURRENT_USER SET search_path TO ${SCHEMA}, public`).catch(() => undefined);
   await q(`
-    CREATE TABLE IF NOT EXISTS vehicle (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.vehicle (
       id                TEXT PRIMARY KEY,
       vin               TEXT,
       lot_no            BIGINT,
@@ -111,13 +117,13 @@ export async function migrate(): Promise<void> {
 
     -- VIN dedup for relistings (§5). Partial: many rows legitimately have no
     -- VIN, and those must not collide with one another.
-    CREATE UNIQUE INDEX IF NOT EXISTS vehicle_vin_uniq ON vehicle (vin) WHERE vin IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS vehicle_open ON vehicle (delisted_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS vehicle_vin_uniq ON ${SCHEMA}.vehicle (vin) WHERE vin IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS vehicle_open ON ${SCHEMA}.vehicle (delisted_at);
 
     -- Immutable. One row per evaluation; re-runs append. Never updated.
-    CREATE TABLE IF NOT EXISTS assessment (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.assessment (
       id                BIGGENERATED,
-      vehicle_id        TEXT NOT NULL REFERENCES vehicle(id),
+      vehicle_id        TEXT NOT NULL REFERENCES ${SCHEMA}.vehicle(id),
       assessed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
       config_version    TEXT NOT NULL,
       gate              TEXT NOT NULL,
@@ -131,20 +137,20 @@ export async function migrate(): Promise<void> {
       margin_aed        BIGINT,
       reasons           JSONB
     );
-    CREATE INDEX IF NOT EXISTS assessment_vehicle ON assessment (vehicle_id, assessed_at);
+    CREATE INDEX IF NOT EXISTS assessment_vehicle ON ${SCHEMA}.assessment (vehicle_id, assessed_at);
 
-    CREATE TABLE IF NOT EXISTS price_history (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.price_history (
       id            BIGGENERATED,
-      vehicle_id    TEXT NOT NULL REFERENCES vehicle(id),
+      vehicle_id    TEXT NOT NULL REFERENCES ${SCHEMA}.vehicle(id),
       observed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
       starting_bid  BIGINT,
       status        TEXT,
       auction_id    TEXT
     );
-    CREATE INDEX IF NOT EXISTS price_history_vehicle ON price_history (vehicle_id);
+    CREATE INDEX IF NOT EXISTS price_history_vehicle ON ${SCHEMA}.price_history (vehicle_id);
 
-    CREATE TABLE IF NOT EXISTS watchlist (
-      vehicle_id   TEXT PRIMARY KEY REFERENCES vehicle(id),
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.watchlist (
+      vehicle_id   TEXT PRIMARY KEY REFERENCES ${SCHEMA}.vehicle(id),
       auction_id   TEXT,
       lot_no       BIGINT,
       lane         TEXT,
@@ -154,12 +160,12 @@ export async function migrate(): Promise<void> {
       resolved_at  TIMESTAMPTZ,
       outcome      TEXT
     );
-    CREATE INDEX IF NOT EXISTS watchlist_open ON watchlist (auction_id, resolved_at);
+    CREATE INDEX IF NOT EXISTS watchlist_open ON ${SCHEMA}.watchlist (auction_id, resolved_at);
 
     -- amount IS NULL ⇒ gap_reason populated. A lot is never omitted (§8.4).
-    CREATE TABLE IF NOT EXISTS bid_observation (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.bid_observation (
       id           BIGGENERATED,
-      vehicle_id   TEXT NOT NULL REFERENCES vehicle(id),
+      vehicle_id   TEXT NOT NULL REFERENCES ${SCHEMA}.vehicle(id),
       auction_id   TEXT,
       lane         TEXT,
       observed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -168,22 +174,22 @@ export async function migrate(): Promise<void> {
       gap_reason   TEXT,
       CONSTRAINT amount_or_gap CHECK (amount IS NOT NULL OR gap_reason IS NOT NULL)
     );
-    CREATE INDEX IF NOT EXISTS bid_observation_auction ON bid_observation (auction_id);
+    CREATE INDEX IF NOT EXISTS bid_observation_auction ON ${SCHEMA}.bid_observation (auction_id);
 
-    CREATE TABLE IF NOT EXISTS sitemap_snapshot (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.sitemap_snapshot (
       lot_id   TEXT PRIMARY KEY,
       url      TEXT NOT NULL,
       seen_on  DATE NOT NULL
     );
 
     -- Prevents re-reporting a lot as NEW on a same-day re-run (§12).
-    CREATE TABLE IF NOT EXISTS digest_log (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.digest_log (
       vehicle_id     TEXT PRIMARY KEY,
       first_sent_on  DATE NOT NULL,
       last_sent_on   DATE NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS run_log (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.run_log (
       id           BIGGENERATED,
       started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
       finished_at  TIMESTAMPTZ,
@@ -191,6 +197,18 @@ export async function migrate(): Promise<void> {
       stats_json   JSONB
     );
   `.replace(/BIGGENERATED/g, 'BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY'));
+
+  // The DDL above is schema-qualified, so it always lands correctly. The
+  // runtime queries are not, so prove resolution works on a *fresh* connection
+  // rather than discovering it mid-run at 06:00.
+  await closeDb();
+  const [check] = await q<{ resolved: string | null }>(`SELECT to_regclass('vehicle')::text AS resolved`);
+  if (!check?.resolved) {
+    throw new Error(
+      `search_path does not resolve unqualified names to ${SCHEMA}. ` +
+        `Set it on the database role, or qualify the runtime queries.`,
+    );
+  }
 }
 
 // ── vehicle ────────────────────────────────────────────────────────────────
