@@ -67,6 +67,11 @@ export class Fetcher {
     return this.context;
   }
 
+  /** The live auction room opens its own pages against this context (§8.3). */
+  browserContext(): BrowserContext {
+    return this.ctx();
+  }
+
   /**
    * Render one detail page and return the intercepted vehicle payload.
    * Selects the response whose body contains the lot's ObjectId — the page

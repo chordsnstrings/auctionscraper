@@ -21,7 +21,8 @@
  * omitted: capture failures cluster during busy, fast stretches of an auction,
  * and those stretches are not randomly distributed with respect to price.
  */
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { joinLane, type LiveObservation, type RoomSession } from './auctionroom.js';
 import {
   SESSION_STATE_PATH,
   WATCHER_PAUSED_BACKOFF_MS,
@@ -43,45 +44,22 @@ import type { AuctionPayload } from './types.js';
 import * as ui from './ui.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const FRAME_DUMP = 'logs/socket-frames.jsonl';
 
-// ── Route 1: authenticated socket capture ──────────────────────────────────
-
-export interface BidFrame {
-  lotNo: number | null;
-  vehicleId: string | null;
-  amount: number | null;
-  lane: string | null;
-  terminal: boolean;
-}
-
-/**
- * STUB — §8.3 route 1. Not yet implemented, and deliberately not guessed.
- *
- * To implement: run one authenticated capture during a live auction with
- * DUMP_FRAMES=1, which writes every websocket frame to logs/socket-frames.jsonl.
- * Identify the message carrying the running bid and the lot identifier, then
- * replace this body with a real parse.
- *
- * Returning null here is correct until that capture happens. The poll fallback
- * runs regardless, so an unwired parser degrades capture quality — it does not
- * stop the watcher, and every unobserved lot is still recorded as a gap.
- */
-export function parseSocketFrame(_raw: string): BidFrame | null {
-  return null;
-}
-
-function dumpFrame(raw: string): void {
-  if (process.env.DUMP_FRAMES !== '1') return;
-  mkdirSync('logs', { recursive: true });
-  appendFileSync(FRAME_DUMP, `${JSON.stringify({ at: new Date().toISOString(), raw })}\n`, 'utf8');
-}
+// ── Route 1: authenticated capture from the auction room ──────────────────
+//
+// Implemented in auctionroom.ts: the watcher joins
+// /auction-join?id={auctionId}&lane={lane} with the saved bidder session and
+// reads prices off the room's websocket. See that file for why the frame
+// schema is treated as unconfirmed rather than assumed.
 
 // ── Lane worker ────────────────────────────────────────────────────────────
 
 class LaneWorker {
   private readonly seen = new Set<string>();
   private backoff = WATCHER_RECONNECT_BASE_MS;
+  private room: RoomSession | null = null;
+  /** Best price seen per lot, keyed by lot number. */
+  private readonly prices = new Map<number, LiveObservation>();
 
   constructor(
     private readonly fetcher: Fetcher,
@@ -96,6 +74,21 @@ class LaneWorker {
 
   async run(stopAt: () => boolean): Promise<void> {
     ui.step(`lane ${this.lane}`, 'worker started');
+
+    // Join the room first: the websocket is the only anonymous-invisible source
+    // of a hammer price, and polling alone can only ever see sold/unsold.
+    try {
+      this.room = await joinLane(
+        this.fetcher.browserContext(),
+        this.auctionId,
+        this.lane,
+        (o) => this.onLive(o),
+        (m) => ui.note(`lane ${this.lane}: ${m}`),
+      );
+    } catch (err) {
+      ui.warn(`lane ${this.lane}: could not join room — ${(err as Error).message.slice(0, 80)}`);
+      ui.note('falling back to poll-only capture; every unobserved lot is gap-flagged');
+    }
 
     while (!stopAt()) {
       let auction: AuctionPayload | undefined;
@@ -144,7 +137,18 @@ class LaneWorker {
       await sleep(WATCHER_POLL_MS);
     }
 
+    await this.room?.close();
     await this.sweep();
+  }
+
+  /** A price from the room. Highest wins; a named final price always wins. */
+  private onLive(o: LiveObservation): void {
+    if (o.lotNo === null || o.amount === null) return;
+    const prev = this.prices.get(o.lotNo);
+    if (!prev || (o.confident && !prev.confident) || o.amount > (prev.amount ?? 0)) {
+      this.prices.set(o.lotNo, o);
+      ui.note(`lane ${this.lane}: lot ${o.lotNo} @ ${o.amount} (${o.via}${o.confident ? '' : ', unconfirmed'})`);
+    }
   }
 
   /**
@@ -153,15 +157,34 @@ class LaneWorker {
    */
   private async sweep(): Promise<void> {
     for (const t of await this.targets()) {
-      await recordObservation({
-        vehicleId: t.vehicle_id,
-        auctionId: this.auctionId,
-        lane: this.lane,
-        amount: null,
-        source: 'poll',
-        gapReason: 'socket frame parser not implemented — no hammer price observed (§8.3 route 1)',
-      });
-      await resolveWatch(t.vehicle_id, 'unobserved');
+      const seen = t.lot_no !== null ? this.prices.get(Number(t.lot_no)) : undefined;
+
+      // A price is only recorded when the room named it as a bid or sale. An
+      // ambiguous match is reported as a gap carrying the candidate, so it can
+      // be reconciled against the frame log rather than trusted as money.
+      if (seen && seen.confident) {
+        await recordObservation({
+          vehicleId: t.vehicle_id,
+          auctionId: this.auctionId,
+          lane: this.lane,
+          amount: seen.amount,
+          source: 'socket',
+          gapReason: null,
+        });
+        await resolveWatch(t.vehicle_id, seen.status ?? 'observed');
+      } else {
+        await recordObservation({
+          vehicleId: t.vehicle_id,
+          auctionId: this.auctionId,
+          lane: this.lane,
+          amount: null,
+          source: seen ? 'socket' : 'poll',
+          gapReason: seen
+            ? `ambiguous price ${seen.amount} via "${seen.via}" — not confirmed as a bid or sale`
+            : 'no price frame observed for this lot',
+        });
+        await resolveWatch(t.vehicle_id, 'unobserved');
+      }
     }
   }
 }
@@ -227,7 +250,6 @@ async function watch(): Promise<void> {
     await closeDb();
   }
 
-  void dumpFrame;
 }
 
 watch().catch((err: unknown) => {

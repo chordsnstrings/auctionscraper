@@ -47,17 +47,19 @@ export function db(): Pool {
   pool = new Pool({
     connectionString,
     ssl,
+    // Postgres 15 revoked CREATE on `public` from everyone but the database
+    // owner, and managed providers hand out a non-owner role, so the app owns
+    // its own schema instead.
+    //
+    // This is passed as a startup option rather than a `SET` statement on
+    // purpose: `SET` binds to one pooled connection, so a later query served by
+    // a different connection would silently fall back to `public` and fail.
+    // The server applies `options` when each connection is established, so
+    // every connection in the pool is identical by construction.
+    options: `-c search_path=${SCHEMA},public`,
     max: 4,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 15_000,
-  });
-
-  // Postgres 15 revoked CREATE on `public` from everyone but the database
-  // owner, and managed providers hand out a non-owner role. Everything lives in
-  // an application-owned schema instead of fighting that; the search_path is
-  // pinned per connection so unqualified table names keep working.
-  pool.on('connect', (client) => {
-    client.query(`SET search_path TO ${SCHEMA}, public`).catch(() => undefined);
   });
 
   return pool;
@@ -78,9 +80,9 @@ export const today = (): string => new Date().toISOString().slice(0, 10);
 
 export async function migrate(): Promise<void> {
   // Owned by the connecting role, so it has CREATE here even though Postgres 15
-  // denies it on `public`.
+  // denies it on `public`. Explicitly named, so it does not depend on
+  // search_path pointing anywhere useful yet.
   await q(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA} AUTHORIZATION CURRENT_USER`);
-  await q(`SET search_path TO ${SCHEMA}, public`);
   await q(`
     CREATE TABLE IF NOT EXISTS vehicle (
       id                TEXT PRIMARY KEY,

@@ -8,6 +8,7 @@
  * the ones about what must NOT happen.
  */
 import assert from 'node:assert/strict';
+import { auctionRoomUrl, decodeFrame, extractObservations } from './auctionroom.js';
 import { MAX_RENDERS_PER_RUN, MIN_MODEL_YEAR } from './config.js';
 import { renderDigest } from './digest.js';
 import { MOTION_CSS, stagger } from './digest/motion.js';
@@ -399,6 +400,53 @@ check('digest HTML is self-contained: no external CSS, JS or webfonts', () => {
   assert.ok(!/<script/i.test(html), 'no script tags — every mail client strips them');
   assert.ok(!/<link\b/i.test(html), 'no external stylesheets');
   assert.ok(!/@import/i.test(html), 'no font imports');
+});
+
+// ── §8.3 auction-room capture ──────────────────────────────────────────────
+
+check('§8.3 socket envelopes decode (raw JSON and socket.io prefixed)', () => {
+  assert.deepEqual(decodeFrame('{"a":1}'), { a: 1 });
+  assert.deepEqual(decodeFrame('42[\"bid\",{\"lotNo\":5}]'), ['bid', { lotNo: 5 }]);
+  assert.equal(decodeFrame('ping'), null);
+  assert.equal(decodeFrame('2probe'), null);
+});
+
+check('§8.3 a named final price beside a lot number is extracted confidently', () => {
+  const [o] = extractObservations({ event: 'sold', data: { lotNo: 192211, hammerPrice: 41500, status: 'sold' } });
+  assert.ok(o);
+  assert.equal(o.lotNo, 192211);
+  assert.equal(o.amount, 41500);
+  assert.equal(o.status, 'sold');
+  assert.equal(o.confident, true);
+});
+
+check('§8.3 a running bid is extracted confidently', () => {
+  const [o] = extractObservations({ lotNo: 7, currentBid: '38,500' });
+  assert.equal(o?.amount, 38_500, 'thousands separators must not defeat the parse');
+  assert.equal(o?.confident, true);
+});
+
+check('§8.3 a bare "amount" is captured but flagged unconfirmed, never trusted', () => {
+  const [o] = extractObservations({ lotNo: 9, amount: 1234 });
+  assert.equal(o?.amount, 1234);
+  assert.equal(o?.confident, false, 'an ambiguous field must not be recorded as money');
+});
+
+check('§8.3 a price with no lot identifier is ignored', () => {
+  assert.equal(extractObservations({ hammerPrice: 50_000 }).length, 0);
+});
+
+check('§8.3 nested envelopes are walked', () => {
+  const found = extractObservations({ t: 'update', payload: { lanes: [{ lots: [{ lotNo: 1, currentBid: 100 }] }] } });
+  assert.equal(found.length, 1);
+  assert.equal(found[0]?.lotNo, 1);
+});
+
+check('§8.3 the room URL is built for the lane', () => {
+  assert.equal(
+    auctionRoomUrl('6a673203222e2dd50395dcfd', 'lane-a'),
+    'https://alqaryahauction.com/auction-join?id=6a673203222e2dd50395dcfd&lane=lane-a',
+  );
 });
 
 // ── budget ─────────────────────────────────────────────────────────────────
