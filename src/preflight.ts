@@ -226,13 +226,23 @@ async function checkRenderAndPhoto(fetcher: Fetcher, refs: readonly LotRef[]): P
     if (probe) {
       const d = await fetcher.diagnoseLot(probe);
       ui.note(`      page ${d.status} "${d.title}" → ${d.finalUrl.slice(0, 100)}`);
-      if (d.responses.length === 0) {
-        ui.note('      the page made no requests to alqaryahauction.com at all');
+      ui.note(`      ${d.responses.length} response(s) recorded · API_RESPONSE_PATTERN = ${API_RESPONSE_PATTERN}`);
+
+      const carrying = d.responses.filter((r) => r.hasId);
+      for (const r of carrying.slice(0, 6)) {
+        ui.note(`      HAS-ID ${String(r.status).padEnd(4)} ${r.bytes}B ${r.url}`);
       }
-      for (const r of d.responses.slice(0, 12)) {
-        ui.note(`      ${String(r.status).padEnd(4)} ${r.hasId ? 'HAS-ID' : '      '} ${r.bytes}B ${r.url}`);
+      if (carrying.length === 0) {
+        for (const r of d.responses.slice(0, 10)) {
+          ui.note(`             ${String(r.status).padEnd(4)} ${r.bytes}B ${r.url}`);
+        }
       }
-      ui.note(`      API_RESPONSE_PATTERN = ${API_RESPONSE_PATTERN}`);
+
+      const page = await fetcher.inspectRenderedPage(probe);
+      ui.note(
+        `      rendered HTML: id ${page.idInHtml ? 'PRESENT' : 'absent'} · ${page.jsonBlobs} json script block(s)`,
+      );
+      if (page.sample) ui.note(`      …${page.sample.slice(0, 180)}…`);
     }
     return;
   }

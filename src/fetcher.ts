@@ -221,25 +221,28 @@ export class Fetcher {
   }> {
     const page = await this.ctx().newPage();
     const responses: { url: string; status: number; hasId: boolean; bytes: number }[] = [];
+    const needle = ref.id.toLowerCase();
 
+    // Every response, whatever the host: if the API moved off
+    // alqaryahauction.com entirely, filtering by that domain is exactly what
+    // would hide it.
     const onResponse = async (res: {
       url(): string;
       status(): number;
       text(): Promise<string>;
     }): Promise<void> => {
       const url = res.url();
-      if (!/alqaryahauction\.com/i.test(url)) return;
-      if (/\.(?:js|css|woff2?|png|jpe?g|svg|webp|ico)(?:\?|$)/i.test(url)) return;
+      if (/\.(?:css|woff2?|png|jpe?g|gif|svg|webp|ico|mp4)(?:\?|$)/i.test(url)) return;
       let body = '';
       try {
         body = await res.text();
       } catch {
-        /* body already consumed or a redirect */
+        /* body already consumed, or a redirect with none */
       }
       responses.push({
-        url: url.slice(0, 120),
+        url: url.slice(0, 140),
         status: res.status(),
-        hasId: body.toLowerCase().includes(ref.id.toLowerCase()),
+        hasId: body.toLowerCase().includes(needle),
         bytes: body.length,
       });
     };
@@ -247,7 +250,7 @@ export class Fetcher {
     page.on('response', onResponse);
     try {
       const nav = await page.goto(ref.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => undefined);
+      await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => undefined);
       return {
         status: nav?.status() ?? 0,
         finalUrl: page.url(),
@@ -258,6 +261,38 @@ export class Fetcher {
       return { status: -1, finalUrl: (err as Error).message.slice(0, 80), title: '', responses };
     } finally {
       page.off('response', onResponse);
+      await page.close().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Does the rendered page itself carry the lot data?
+   *
+   * §2.1 recorded that the detail HTML holds no vehicle fields, which is why
+   * this scrapes nothing and intercepts instead. If a server-rendered build has
+   * since shipped, the data would be sitting in the document and the absence of
+   * an XHR would be the expected behaviour rather than a fault — so check
+   * before concluding the pipeline is blocked.
+   */
+  async inspectRenderedPage(ref: LotRef): Promise<{ idInHtml: boolean; jsonBlobs: number; sample: string }> {
+    const page = await this.ctx().newPage();
+    try {
+      await page.goto(ref.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => undefined);
+      const html = await page.content();
+      const needle = ref.id.toLowerCase();
+      const lower = html.toLowerCase();
+      const idInHtml = lower.includes(needle);
+      const blobs = html.match(/<script[^>]+type=["']application\/(?:ld\+)?json["'][^>]*>/gi) ?? [];
+      const at = lower.indexOf(needle);
+      return {
+        idInHtml,
+        jsonBlobs: blobs.length,
+        sample: at >= 0 ? html.slice(Math.max(0, at - 120), at + 120).replace(/\s+/g, ' ') : '',
+      };
+    } catch (err) {
+      return { idInHtml: false, jsonBlobs: 0, sample: (err as Error).message.slice(0, 80) };
+    } finally {
       await page.close().catch(() => undefined);
     }
   }
