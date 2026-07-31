@@ -1,0 +1,19 @@
+node_modules/
+dist/
+logs/
+*.log
+
+# Runtime state — never commit. Ignore the contents, not the directory itself,
+# so the negation below is actually reachable.
+data/*
+!data/.gitkeep
+
+# Persisted bidder session. Treat as a secret (§8.3).
+data/session.json
+
+.env
+.env.local
+
+# Digest preview output
+preview/
+.DS_Store
