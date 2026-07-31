@@ -274,7 +274,9 @@ export class Fetcher {
    * an XHR would be the expected behaviour rather than a fault — so check
    * before concluding the pipeline is blocked.
    */
-  async inspectRenderedPage(ref: LotRef): Promise<{ idInHtml: boolean; jsonBlobs: number; sample: string }> {
+  async inspectRenderedPage(
+    ref: LotRef,
+  ): Promise<{ idInHtml: boolean; jsonBlobs: number; bytes: number; scripts: string[]; sample: string }> {
     const page = await this.ctx().newPage();
     try {
       await page.goto(ref.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
@@ -282,19 +284,73 @@ export class Fetcher {
       const html = await page.content();
       const needle = ref.id.toLowerCase();
       const lower = html.toLowerCase();
-      const idInHtml = lower.includes(needle);
       const blobs = html.match(/<script[^>]+type=["']application\/(?:ld\+)?json["'][^>]*>/gi) ?? [];
+      const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) => m[1] ?? '');
       const at = lower.indexOf(needle);
       return {
-        idInHtml,
+        idInHtml: at >= 0,
         jsonBlobs: blobs.length,
+        bytes: html.length,
+        scripts: scripts.slice(0, 8),
         sample: at >= 0 ? html.slice(Math.max(0, at - 120), at + 120).replace(/\s+/g, ' ') : '',
       };
     } catch (err) {
-      return { idInHtml: false, jsonBlobs: 0, sample: (err as Error).message.slice(0, 80) };
+      return { idInHtml: false, jsonBlobs: 0, bytes: 0, scripts: [], sample: (err as Error).message.slice(0, 80) };
     } finally {
       await page.close().catch(() => undefined);
     }
+  }
+
+  /**
+   * The same render on a context with none of our configuration.
+   *
+   * The detail page loads its document and then requests nothing at all — not
+   * even its own bundles. That is far more consistent with something we are
+   * doing to the context than with the site changing: the `**\/*` route, and
+   * `extraHTTPHeaders` that pin `Sec-Fetch-Dest: document` and
+   * `Sec-Fetch-Mode: navigate` onto every subresource, which is a combination
+   * no real browser ever sends for a script. This isolates that.
+   */
+  async diagnoseWithPlainContext(ref: LotRef): Promise<{ responses: number; payloadFound: boolean; hosts: string[] }> {
+    if (!this.browser) return { responses: 0, payloadFound: false, hosts: [] };
+    const ctx = await this.browser.newContext({
+      ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS,
+      userAgent: BROWSER_HEADERS['User-Agent'],
+      locale: 'en-GB',
+      timezoneId: 'Asia/Dubai',
+    });
+    const page = await ctx.newPage();
+    const hosts = new Set<string>();
+    let responses = 0;
+    let payloadFound = false;
+    const needle = ref.id.toLowerCase();
+
+    const onResponse = async (res: { url(): string; text(): Promise<string> }): Promise<void> => {
+      responses += 1;
+      try {
+        hosts.add(new URL(res.url()).host);
+      } catch {
+        /* opaque url */
+      }
+      if (!API_RESPONSE_PATTERN.test(res.url())) return;
+      try {
+        if ((await res.text()).toLowerCase().includes(needle)) payloadFound = true;
+      } catch {
+        /* unreadable body */
+      }
+    };
+
+    page.on('response', onResponse);
+    try {
+      await page.goto(ref.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => undefined);
+    } catch {
+      /* report what was seen up to the failure */
+    } finally {
+      page.off('response', onResponse);
+      await ctx.close().catch(() => undefined);
+    }
+    return { responses, payloadFound, hosts: [...hosts].slice(0, 8) };
   }
 
   /**

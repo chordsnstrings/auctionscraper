@@ -240,9 +240,20 @@ async function checkRenderAndPhoto(fetcher: Fetcher, refs: readonly LotRef[]): P
 
       const page = await fetcher.inspectRenderedPage(probe);
       ui.note(
-        `      rendered HTML: id ${page.idInHtml ? 'PRESENT' : 'absent'} · ${page.jsonBlobs} json script block(s)`,
+        `      rendered HTML ${page.bytes}B: id ${page.idInHtml ? 'PRESENT' : 'absent'} · ` +
+          `${page.jsonBlobs} json block(s) · ${page.scripts.length} script src(s)`,
       );
+      for (const s of page.scripts) ui.note(`        script ${s.slice(0, 110)}`);
       if (page.sample) ui.note(`      …${page.sample.slice(0, 180)}…`);
+
+      const plain = await fetcher.diagnoseWithPlainContext(probe);
+      ui.note(
+        `      plain context: ${plain.responses} response(s) · payload ${plain.payloadFound ? 'FOUND' : 'not found'}` +
+          `${plain.hosts.length ? ` · hosts ${plain.hosts.join(', ')}` : ''}`,
+      );
+      if (plain.payloadFound) {
+        ui.warn('      The page works without our context configuration — the route or headers are the fault.');
+      }
     }
     return;
   }
