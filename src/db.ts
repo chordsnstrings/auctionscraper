@@ -20,11 +20,30 @@ export function db(): Pool {
   if (!DATABASE_URL) {
     throw new Error('DATABASE_URL is not set — the app cannot reach its database.');
   }
+  // `sslmode` inside the connection string wins over the `ssl` option object,
+  // and pg maps sslmode=require onto verify-full — which fails against managed
+  // Postgres, whose CA the container does not carry. Strip the parameter so the
+  // explicit ssl option below is what actually applies.
+  //
+  // The connection is still TLS-encrypted; only chain verification is relaxed,
+  // and it never leaves DigitalOcean's private network. To tighten it, fetch the
+  // cluster CA and pass it as `ssl.ca` instead.
+  let connectionString = DATABASE_URL;
+  let ssl: false | { rejectUnauthorized: boolean } = false;
+  try {
+    const url = new URL(DATABASE_URL);
+    const mode = url.searchParams.get('sslmode');
+    if (mode && mode !== 'disable') ssl = { rejectUnauthorized: false };
+    url.searchParams.delete('sslmode');
+    connectionString = url.toString();
+  } catch {
+    // Not a parsable URL (a libpq key=value DSN). Fall back to the flag.
+    if (DB_SSL) ssl = { rejectUnauthorized: false };
+  }
+
   pool = new Pool({
-    connectionString: DATABASE_URL,
-    // Managed Postgres presents a CA the container does not carry. The
-    // connection is still TLS; only the chain check is relaxed.
-    ssl: DB_SSL ? { rejectUnauthorized: false } : undefined,
+    connectionString,
+    ssl,
     max: 4,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 15_000,
