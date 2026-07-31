@@ -19,10 +19,17 @@ import {
   DELAY_MS,
   IGNORE_HTTPS_ERRORS,
   NAV_TIMEOUT_MS,
+  PHOTO_TIMEOUT_MS,
   SESSION_STATE_PATH,
 } from './config.js';
 import { normalise } from './normalise.js';
-import { browserPhotoLoader, httpPhotoLoader, type PhotoLoader } from './photos.js';
+import {
+  browserPhotoLoader,
+  httpPhotoLoader,
+  type BytesReader,
+  type BytesResponse,
+  type PhotoLoader,
+} from './photos.js';
 import { httpXmlReader, type XmlReader } from './sitemap.js';
 import type { AuctionPayload, LotRef, NormalisedVehicle, VehiclePayload } from './types.js';
 
@@ -76,27 +83,48 @@ export class Fetcher {
   }
 
   /**
+   * Read a URL's raw bytes through a real navigation.
+   *
+   * This is the only way out of this process that Al Qaryah accepts.
+   * `context.request` looks like the browser — it shares the cookie jar — but
+   * it is Playwright's Node HTTP stack underneath, so its TLS and HTTP/2
+   * fingerprint is a script's and Cloudflare challenges it exactly like plain
+   * `fetch`. A navigation goes through Chromium's own network stack.
+   *
+   * Navigations are `document` requests, so the image-blocking route above does
+   * not touch them, and `response.body()` returns the bytes off the wire rather
+   * than anything Chromium rendered from them.
+   */
+  async readBytes(url: string, timeoutMs = NAV_TIMEOUT_MS): Promise<BytesResponse | null> {
+    if (!this.context) return null;
+    const page = await this.context.newPage();
+    try {
+      // `commit` returns as soon as the response arrives — there is nothing to
+      // wait for here, and an image would otherwise be decoded for nothing.
+      const res = await page.goto(url, { waitUntil: 'commit', timeout: timeoutMs });
+      if (!res) return null;
+      return { ok: res.ok(), body: await res.body() };
+    } catch {
+      return null;
+    } finally {
+      await page.close().catch(() => undefined);
+    }
+  }
+
+  /**
    * An XML reader bound to this context, for the sitemap walk.
    *
    * The sitemap is the entry point to everything: if Cloudflare serves it a
    * challenge, the crawl finds zero lots and the digest is empty for a reason
-   * no one can see. Reading it through the browser context uses the same path
-   * that gets 200s on the detail pages.
+   * no one can see. Requiring a `<loc>` is what turns that into a failure.
    */
   xmlReader(): XmlReader {
     return async (url) => {
       if (!this.context) return httpXmlReader(url);
-      try {
-        const res = await this.context.request.get(url, {
-          headers: { ...BROWSER_HEADERS, Accept: 'application/xml,text/xml,*/*' },
-          timeout: NAV_TIMEOUT_MS,
-        });
-        if (!res.ok()) return null;
-        const body = await res.text();
-        return /<loc>/i.test(body) ? body : null;
-      } catch {
-        return null;
-      }
+      const res = await this.readBytes(url);
+      if (!res?.ok) return null;
+      const body = res.body.toString('utf8');
+      return /<loc>/i.test(body) ? body : null;
     };
   }
 
@@ -105,15 +133,26 @@ export class Fetcher {
    *
    * Images are aborted during render precisely so they cost nothing there —
    * but the vision provider still has to be shown the bytes, and its own egress
-   * has no standing with Cloudflare. Fetching them through this context reuses
-   * the clearance the render already earned. Once the fetcher is closed the
-   * loader degrades to plain HTTP rather than throwing.
+   * has no standing with Cloudflare. Once the fetcher is closed the loader
+   * degrades to plain HTTP rather than throwing.
    */
   photoLoader(): PhotoLoader {
+    const read: BytesReader = (url) => this.readBytes(url, PHOTO_TIMEOUT_MS);
     return async (url) => {
       if (!this.context) return httpPhotoLoader(url);
-      return browserPhotoLoader(this.context.request)(url);
+      return browserPhotoLoader(read)(url);
     };
+  }
+
+  /** JSON from the API host, read the same way and for the same reason. */
+  private async readJson(url: string, timeoutMs = NAV_TIMEOUT_MS): Promise<unknown | null> {
+    const res = await this.readBytes(url, timeoutMs);
+    if (!res?.ok) return null;
+    try {
+      return JSON.parse(res.body.toString('utf8')) as unknown;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -196,41 +235,20 @@ export class Fetcher {
 
   /** Unauthenticated auction state (§2.3). Used by the run and the watcher. */
   async activeAuctions(): Promise<AuctionPayload[]> {
-    const page = await this.ctx().newPage();
-    try {
-      const res = await page.request.get(`${API_ORIGIN}/auction/active-auctions`, {
-        headers: BROWSER_HEADERS,
-        timeout: NAV_TIMEOUT_MS,
-      });
-      if (!res.ok()) return [];
-      const json = (await res.json()) as unknown;
-      return harvestAuctions(json);
-    } catch {
-      return [];
-    } finally {
-      await page.close().catch(() => undefined);
-    }
+    const json = await this.readJson(`${API_ORIGIN}/auction/active-auctions`);
+    return json === null ? [] : harvestAuctions(json);
   }
 
   /** Server clock. Never key auction timing off local time (§8.5). */
   async serverTime(): Promise<Date | null> {
-    const page = await this.ctx().newPage();
-    try {
-      const res = await page.request.get(`${API_ORIGIN}/getdbtime/getCurrentTime?timezone=UTC`, {
-        headers: BROWSER_HEADERS,
-        timeout: 15_000,
-      });
-      if (!res.ok()) return null;
-      const text = await res.text();
-      const iso = /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/.exec(text)?.[0];
-      if (!iso) return null;
-      const d = new Date(iso.replace(' ', 'T').endsWith('Z') ? iso.replace(' ', 'T') : `${iso.replace(' ', 'T')}Z`);
-      return Number.isNaN(d.getTime()) ? null : d;
-    } catch {
-      return null;
-    } finally {
-      await page.close().catch(() => undefined);
-    }
+    const res = await this.readBytes(`${API_ORIGIN}/getdbtime/getCurrentTime?timezone=UTC`, 15_000);
+    if (!res?.ok) return null;
+    const text = res.body.toString('utf8');
+    const iso = /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/.exec(text)?.[0];
+    if (!iso) return null;
+    const normalised = iso.replace(' ', 'T');
+    const d = new Date(normalised.endsWith('Z') ? normalised : `${normalised}Z`);
+    return Number.isNaN(d.getTime()) ? null : d;
   }
 }
 

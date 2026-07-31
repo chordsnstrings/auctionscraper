@@ -27,11 +27,14 @@ export interface InlinePhoto {
 /** Resolves one photo URL to inline bytes, or null if it cannot be had. */
 export type PhotoLoader = (url: string) => Promise<InlinePhoto | null>;
 
-/** Response shape common to `fetch` and Playwright's APIRequestContext. */
-interface BytesResponse {
+/** Response shape common to plain `fetch` and a browser navigation. */
+export interface BytesResponse {
   ok: boolean;
   body: Buffer;
 }
+
+/** Reads a URL's raw bytes. The browser supplies one; plain HTTP is the other. */
+export type BytesReader = (url: string) => Promise<BytesResponse | null>;
 
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -99,26 +102,22 @@ export const httpPhotoLoader: PhotoLoader = async (url) => {
   }
 };
 
-/** Minimal view of Playwright's APIRequestContext, so this file imports none of it. */
-export interface RequestLike {
-  get(
-    url: string,
-    opts?: { headers?: Record<string, string>; timeout?: number },
-  ): Promise<{ ok(): boolean; body(): Promise<Buffer> }>;
-}
-
 /**
- * Fetch through the browser context. This carries the session cookies — the
- * Cloudflare clearance among them — and Chromium's TLS fingerprint, which is
- * the whole reason the render path works where plain `fetch` gets a 403.
- * Falls back to plain HTTP so one refused image never costs the whole lot.
+ * Load photos through the browser, falling back to plain HTTP per image.
+ *
+ * The browser reader wins because it is Chromium's own network stack: the same
+ * TLS and HTTP/2 fingerprint that gets 200s on the detail pages, rather than
+ * Node's, which Cloudflare scores like any other script. One refused image
+ * should never cost the whole lot, hence the fallback.
  */
-export function browserPhotoLoader(request: RequestLike): PhotoLoader {
+export function browserPhotoLoader(read: BytesReader): PhotoLoader {
   return async (url) => {
     try {
-      const res = await request.get(url, { headers: IMAGE_HEADERS, timeout: PHOTO_TIMEOUT_MS });
-      const inline = toInline(url, { ok: res.ok(), body: await res.body() });
-      if (inline) return inline;
+      const res = await read(url);
+      if (res) {
+        const inline = toInline(url, res);
+        if (inline) return inline;
+      }
     } catch {
       /* fall through */
     }
@@ -127,11 +126,30 @@ export function browserPhotoLoader(request: RequestLike): PhotoLoader {
 }
 
 /**
- * Load a set of photos concurrently, preserving order and dropping failures.
+ * Load a set of photos, preserving order and dropping failures.
+ *
  * Order matters: normalise.ts sorts the default/inventory image first, and the
- * first photo is the one the model anchors on.
+ * first photo is the one the model anchors on. Concurrency is deliberately low
+ * — each browser-backed load is a page, and this container has 1 GB against a
+ * Chromium that already peaks near 865 MB during a render.
  */
-export async function loadPhotos(urls: readonly string[], loader: PhotoLoader): Promise<InlinePhoto[]> {
-  const settled = await Promise.all(urls.map((u) => loader(u).catch(() => null)));
-  return settled.filter((p): p is InlinePhoto => p !== null);
+export async function loadPhotos(
+  urls: readonly string[],
+  loader: PhotoLoader,
+  concurrency = 2,
+): Promise<InlinePhoto[]> {
+  const out: (InlinePhoto | null)[] = new Array(urls.length).fill(null);
+  let cursor = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = cursor++;
+      const url = urls[i];
+      if (url === undefined) return;
+      out[i] = await loader(url).catch(() => null);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, worker));
+  return out.filter((p): p is InlinePhoto => p !== null);
 }
